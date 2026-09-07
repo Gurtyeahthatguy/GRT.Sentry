@@ -1,0 +1,6 @@
+# Absolute build paths in the binary would name whoever compiled it.
+[build]
+rustflags = [
+  "--remap-path-prefix=/home=/redacted",
+  "--remap-path-prefix=/Users=/redacted",
+]

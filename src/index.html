@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GRT Sentry</title>
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <header class="chrome">
+      <div class="brand">GRT Sentry</div>
+      <nav class="tabs" id="tabs">
+        <button class="tab is-active" data-tab="status">Status</button>
+        <button class="tab" data-tab="connections">Connections</button>
+        <button class="tab" data-tab="quarantine">Quarantine</button>
+        <button class="tab" data-tab="settings">Settings</button>
+      </nav>
+      <div class="chrome-end"><span id="version" class="dim"></span></div>
+    </header>
+
+    <main>
+      <!-- Status ------------------------------------------------------->
+      <section class="panel is-active" id="panel-status">
+        <div class="verdict" id="verdict">
+          <div class="verdict-mark" id="verdict-mark" aria-hidden="true"></div>
+          <h1 class="verdict-line" id="verdict-line">Not scanned yet</h1>
+          <p class="verdict-detail dim" id="verdict-detail">
+            Press Scan now to check files, connections, updates, startup entries and system files.
+          </p>
+          <div class="counters dim" id="counters"></div>
+
+          <div class="verdict-actions">
+            <button class="primary" id="btn-scan">Scan now</button>
+            <button id="btn-scan-folder">Scan a folder…</button>
+            <button id="btn-scan-file">Check one file…</button>
+            <button id="btn-cancel" hidden>Stop</button>
+          </div>
+
+          <div class="progress" id="progress" hidden>
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+            <div class="progress-text dim" id="progress-text"></div>
+          </div>
+        </div>
+
+        <div id="issues" class="issues"></div>
+      </section>
+
+      <!-- Connections -------------------------------------------------->
+      <section class="panel" id="panel-connections">
+        <div class="toolbar">
+          <button id="btn-refresh-connections">Refresh</button>
+          <input type="search" id="connection-filter" placeholder="Filter by process, address or place" />
+          <label class="check"><input type="checkbox" id="hide-private" checked /> Hide local network</label>
+          <span class="dim" id="connection-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table class="grid" id="connections-table">
+            <thead>
+              <tr>
+                <th>Process</th>
+                <th>Remote address</th>
+                <th>Port</th>
+                <th>State</th>
+                <th>Where it is announced from</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="connections-body"></tbody>
+          </table>
+        </div>
+        <div class="pager" id="connections-pager"></div>
+        <p class="footnote dim">
+          A location says where the network announcing the address is registered, usually a data
+          centre or a provider. It is not where a person is, and it is not a street address.
+        </p>
+      </section>
+
+      <!-- Quarantine --------------------------------------------------->
+      <section class="panel" id="panel-quarantine">
+        <h2>Quarantined files</h2>
+        <p class="dim">
+          Moved out of the way, renamed and stripped of every permission, but not destroyed.
+          Putting one back restores its original name and permissions.
+        </p>
+        <div id="quarantine-list" class="cards"></div>
+
+        <h2>What GRT Sentry has done</h2>
+        <p class="dim">Every action taken on this machine, newest first. What can be undone says so.</p>
+        <div id="action-log" class="log"></div>
+
+        <h2>Trusted files</h2>
+        <p class="dim">
+          Hashes marked as known-good. Trust follows the contents, not the name: change the file and
+          it is checked again.
+        </p>
+        <div id="allowlist" class="cards"></div>
+
+        <h2>Trusted addresses</h2>
+        <div id="trusted-ips" class="cards"></div>
+      </section>
+
+      <!-- Settings ----------------------------------------------------->
+      <section class="panel" id="panel-settings">
+        <h2>VirusTotal</h2>
+        <div class="field">
+          <label for="api-key">API key</label>
+          <div class="row">
+            <input type="password" id="api-key" placeholder="not set" autocomplete="off" spellcheck="false" />
+            <button id="btn-save-key">Save</button>
+            <button id="btn-clear-key">Remove</button>
+          </div>
+          <p class="hint dim" id="api-key-hint"></p>
+          <p class="hint dim">
+            Only the hash of a file is ever sent: 64 characters that cannot be turned back into
+            the file. Contents are uploaded only by the button that says so, on an issue. A free
+            key comes from virustotal.com, under your profile.
+          </p>
+        </div>
+
+        <div class="field">
+          <label for="vt-interval">Seconds between requests</label>
+          <div class="row">
+            <input type="number" id="vt-interval" min="15" max="3600" />
+            <span class="hint dim">The free tier allows four a minute, so 15 is the floor.</span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="vt-budget">Most lookups in one scan</label>
+          <div class="row">
+            <input type="number" id="vt-budget" min="1" max="500" />
+            <span class="hint dim">Whatever is left over is hashed and checked on the next scan.</span>
+          </div>
+        </div>
+
+        <h2>What to scan</h2>
+        <div class="field">
+          <label for="scan-paths">Folders, one per line</label>
+          <textarea id="scan-paths" rows="5" spellcheck="false"></textarea>
+        </div>
+
+        <div class="field">
+          <label for="max-size">Skip files larger than (MB)</label>
+          <input type="number" id="max-size" min="1" max="4096" />
+        </div>
+
+        <label class="check"><input type="checkbox" id="deep-scan" /> Check every file, not only programs and archives</label>
+        <label class="check"><input type="checkbox" id="scan-on-startup" /> Scan when the window opens</label>
+        <label class="check"><input type="checkbox" id="watch-folders" /> Watch those folders and say when something new arrives</label>
+
+        <h2>When something is found</h2>
+        <label class="check"><input type="checkbox" id="auto-quarantine" /> Quarantine automatically above a number of detections</label>
+        <div class="field">
+          <label for="auto-threshold">Engines needed for that</label>
+          <input type="number" id="auto-threshold" min="1" max="100" />
+        </div>
+
+        <h2>Scheduled scan</h2>
+        <div class="field">
+          <div class="row">
+            <select id="schedule-frequency">
+              <option value="off">Off</option>
+              <option value="hourly">Hourly</option>
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+            </select>
+            <button id="btn-save-schedule">Apply</button>
+          </div>
+          <p class="hint dim" id="schedule-status"></p>
+        </div>
+
+        <h2>System checks</h2>
+        <div class="field">
+          <label for="auth-log">Authentication log</label>
+          <input type="text" id="auth-log" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label for="login-threshold">Failed logins from one address before reporting</label>
+          <input type="number" id="login-threshold" min="1" max="1000" />
+        </div>
+        <div class="field">
+          <label for="integrity-paths">System files to watch, one per line</label>
+          <textarea id="integrity-paths" rows="5" spellcheck="false"></textarea>
+        </div>
+
+        <h2>Connections</h2>
+        <div class="field">
+          <label for="refresh-seconds">Refresh the connections tab every (seconds, 0 for never)</label>
+          <input type="number" id="refresh-seconds" min="0" max="3600" />
+        </div>
+
+        <h2>Appearance</h2>
+        <div class="field">
+          <select id="theme">
+            <option value="system">Follow the desktop</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+
+        <div class="row">
+          <button class="primary" id="btn-save-settings">Save settings</button>
+          <span class="dim" id="settings-saved"></span>
+        </div>
+
+        <h2>This installation</h2>
+        <dl class="facts" id="system-facts"></dl>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <script type="module" src="js/main.js"></script>
+  </body>
+</html>

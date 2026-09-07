@@ -1,0 +1,73 @@
+[package]
+name = "grt-sentry"
+version = "0.1.0"
+description = "Local security scanner: checks files, connections and system state on demand"
+authors = ["GRT Project"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+# The `_lib` suffix keeps the library name distinct from the binary name.
+name = "grt_sentry_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+
+sha2 = "0.10"
+# `bundled` compiles SQLite into the binary.
+rusqlite = { version = "0.32", features = ["bundled"] }
+maxminddb = "0.24"
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+notify = "6"
+toml = "0.8"
+chrono = "0.4"
+
+# Reading /proc, which is where Linux keeps the socket table.
+[target.'cfg(not(windows))'.dependencies]
+procfs = "0.16"
+
+# On Linux, rustls keeps the TLS stack inside the binary and off the system.
+# On Windows, SChannel is the system stack and needs no C compiler to build.
+[target.'cfg(not(windows))'.dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["json", "rustls-tls", "multipart", "charset", "http2"]
+
+[target.'cfg(windows)'.dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["json", "native-tls", "multipart", "charset", "http2"]
+
+# Reading connections, closing one, and asking whether this process is elevated.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+]
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util` gives the tests a clock they can fast-forward.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+
+# Small binary, no debug symbols. `panic = "abort"` is left out because the
+# test harness needs unwinding.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

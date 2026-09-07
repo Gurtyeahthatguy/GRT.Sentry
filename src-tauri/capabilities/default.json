@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window capabilities. The webview has no network and no shell access: tauri-plugin-http and tauri-plugin-shell are not compiled into the binary, so every outbound request is made by Rust.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "core:webview:deny-create-webview",
+    "core:webview:deny-create-webview-window",
+    "core:window:deny-create"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "grt-sentry",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "author": "GRT Project",
+  "license": "MIT",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "bash scripts/build.sh",
+    "tauri": "tauri",
+    "build:binary": "bash scripts/build.sh --no-bundle"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

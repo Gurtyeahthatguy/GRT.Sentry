@@ -1,0 +1,52 @@
+# Addresses check-build.sh accepts in a release binary, one per line.
+#
+# The claim this list supports is that the only things the binary can contact
+# are the ones written here, each with a reason. A line without a reason does
+# not belong here.
+
+# VirusTotal, the one service the program talks to. It sends the SHA-256 of a
+# file and reads back how many engines flag it.
+https://www.virustotal.com/api/v3/files/
+https://www.virustotal.com/api/v3/files
+https://www.virustotal.com/api/v3/analyses/
+
+# Tauri, wry and muda embed source comments and panic messages that cite their
+# own issue tracker. They are text inside code, never fetched.
+https://github.com/tauri-apps/muda
+https://github.com/tauri-apps/tauri/issues/2549
+https://github.com/tauri-apps/tauri/issues/8306
+https://github.com/tauri-apps/wry/blob
+https://github.com/whatwg/html/issues/7428
+
+# Tauri's own IPC origin on Windows. Local to the process; never leaves the
+# machine.
+http://ipc.localhost
+
+# A placeholder inside a dependency's test fixture.
+http://dummy.test
+
+# Namespace identifiers from XML and certificate handling: names that look
+# like addresses, which nothing resolves.
+http://www.w3.org
+https://www.w3.org
+http://purl.org
+https://purl.org
+http://ns.adobe.com
+
+# Certificate and revocation URLs inside the certificates rustls validates
+# against. Data being checked, not endpoints this program calls.
+http://ocsp.
+http://crl.
+http://cert.
+http://x1.i.lencr.org
+http://x1.c.lencr.org
+http://e5.o.lencr.org
+http://e6.o.lencr.org
+http://r10.o.lencr.org
+http://r11.o.lencr.org
+https://letsencrypt.org
+http://cps.root-x1.letsencrypt.org
+
+# rustls points at its own documentation in the message it prints when TLS
+# configuration is wrong. A sentence in an error, not a request.
+https://docs.rs/rustls

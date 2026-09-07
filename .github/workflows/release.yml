@@ -1,0 +1,166 @@
+# Builds the packages for both systems and attaches them to a GitHub release.
+# Triggered by a tag such as v0.1.0, which must match tauri.conf.json.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev \
+            libayatana-appindicator3-dev libssl-dev patchelf
+
+      - name: Check the tag against the version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "Tag $GITHUB_REF_NAME says $tag, the configuration says $version." >&2
+            exit 1
+          fi
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: npx tauri build --bundles deb,rpm,appimage
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: npx tauri build --bundles nsis
+
+      - name: No-trace check
+        if: runner.os == 'Linux'
+        run: ./scripts/check-build.sh src-tauri/target/release/grt-sentry
+
+      # Tauri names its output after the product, spaces included. Rename to
+      # one shape.
+      - name: Collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          name="grt-sentry-$version"
+          out="$GITHUB_WORKSPACE/dist"
+          bundle="src-tauri/target/release/bundle"
+          mkdir -p "$out"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp "$bundle"/appimage/*.AppImage "$out/$name-linux-x86_64.AppImage"
+            cp "$bundle"/deb/*.deb           "$out/$name-linux-x86_64.deb"
+            cp "$bundle"/rpm/*.rpm           "$out/$name-linux-x86_64.rpm"
+          else
+            cp "$bundle"/nsis/*-setup.exe "$out/$name-windows-x86_64-setup.exe"
+            cp "src-tauri/target/release/grt-sentry.exe" \
+               "$out/$name-windows-x86_64.exe"
+          fi
+          ls -la "$out"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: grt-sentry-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "**On Linux, the \`.AppImage\` is the easy one**: one file,"
+            echo "no installation, runs from anywhere. Make it executable"
+            echo "(\`chmod +x\`) and open it. The \`.deb\` and \`.rpm\` are"
+            echo "there for installing through the package manager."
+            echo
+            echo "**On Windows, take the \`-setup.exe\`**. The plain \`.exe\`"
+            echo "beside it is the same program with no installer. Blocking an"
+            echo "address and closing a connection need administrator rights"
+            echo "there, so start it with Run as administrator when you want"
+            echo "those."
+            echo
+            echo "Two optional steps after installing, both in the README:"
+            echo "a free VirusTotal key to check files against the engines,"
+            echo "and \`scripts/setup-nftables.sh\` to make blocking work."
+            echo
+            echo "The geolocation database is not distributed here, because"
+            echo "MaxMind licenses it separately. \`scripts/fetch-geoip.sh\`"
+            echo "downloads it with a free key. Without it, connections are"
+            echo "listed with no place attached."
+            echo
+            echo "The Linux binary passed \`scripts/check-build.sh\` before"
+            echo "upload: no absolute build paths, no network references"
+            echo "outside the allow list, no telemetry, no debug symbols."
+            echo
+            echo "The Windows build is made by this workflow and is not"
+            echo "code-signed, so Windows will warn about an unknown"
+            echo "publisher."
+            echo
+            echo "\`SHA256SUMS\` covers every file. Verify with"
+            echo "\`sha256sum -c SHA256SUMS\`."
+          } > notes.md
+          cat notes.md
+
+      # A moved tag means the release may already exist.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "GRT Sentry ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md \
+            dist/*

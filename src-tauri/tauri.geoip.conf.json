@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": [
+      "resources/GeoLite2-City.mmdb",
+      "resources/GeoLite2-COPYRIGHT.txt",
+      "resources/GeoLite2-LICENSE.txt"
+    ]
+  }
+}
