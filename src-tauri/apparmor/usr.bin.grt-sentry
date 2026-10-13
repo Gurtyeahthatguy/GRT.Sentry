@@ -61,6 +61,20 @@ profile grt-sentry /usr/bin/grt-sentry {
   owner @{HOME}/.local/share/grt-sentry/{,**} rwk,
   owner @{HOME}/.local/share/grt-sentry/quarantine/{,**} rwk,
 
+  # And WebKitGTK's own store, which is a different directory: it is named
+  # after the Tauri identifier, org.grt.sentry, while everything above is
+  # named after APP_DIR. Both exist. Checked rather than reasoned about —
+  # ~/.local/share/org.grt.sentry holds CacheStorage, WebKitCache,
+  # hsts-storage.sqlite and mediakeys on a machine where this has run.
+  #
+  # The broad rule below grants w here but not k, and sqlite needs the lock,
+  # not the write. A missing k does not look like a permission error from
+  # inside the application: the store simply behaves as if it were empty.
+  owner @{HOME}/.config/org.grt.sentry/{,**} rwk,
+  owner @{HOME}/.cache/org.grt.sentry/{,**} rwk,
+  owner @{HOME}/.local/share/org.grt.sentry/{,**} rwk,
+  owner @{HOME}/.local/state/org.grt.sentry/{,**} rwk,
+
   # Quarantine moves a file out of harm's way, so it has to be able to take it
   # from where it was. Nothing else in the home may be written.
   owner @{HOME}/** w,
