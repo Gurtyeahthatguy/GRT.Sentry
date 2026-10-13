@@ -1,6 +1,6 @@
 # Installing GRT Sentry
 
-The program is at version **0.1.0**, and the same version runs on Linux and on
+The program is at version **0.1.1**, and the same version runs on Linux and on
 Windows.
 
 ---
@@ -14,19 +14,19 @@ be installed to use them.
 no administrator rights, and it runs from anywhere:
 
 ```bash
-chmod +x grt-sentry-0.1.0-linux-x86_64.AppImage
-./grt-sentry-0.1.0-linux-x86_64.AppImage
+chmod +x grt-sentry-0.1.1-linux-x86_64.AppImage
+./grt-sentry-0.1.1-linux-x86_64.AppImage
 ```
 
 The `.deb` and `.rpm` beside it install through the package manager instead,
 which puts the program in the application menu:
 
 ```bash
-sudo apt install ./grt-sentry-0.1.0-linux-x86_64.deb     # Debian, Ubuntu
-sudo dnf install ./grt-sentry-0.1.0-linux-x86_64.rpm     # Fedora
+sudo apt install ./grt-sentry-0.1.1-linux-x86_64.deb     # Debian, Ubuntu
+sudo dnf install ./grt-sentry-0.1.1-linux-x86_64.rpm     # Fedora
 ```
 
-**Windows.** Take `grt-sentry-0.1.0-windows-x86_64-setup.exe`. The plain `.exe`
+**Windows.** Take `grt-sentry-0.1.1-windows-x86_64-setup.exe`. The plain `.exe`
 beside it is the same program with no installer, for a portable copy. Neither
 is code-signed, so Windows will warn about an unknown publisher.
 
