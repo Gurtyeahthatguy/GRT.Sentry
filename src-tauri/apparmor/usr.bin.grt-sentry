@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT
+# AppArmor profile for grt-sentry.
+#
+# This one is the other way round from the rest of the GRT line, and
+# deliberately so. Sentry is a scanner: it hashes files, walks /proc to match
+# sockets to processes, compares system files against baselines and reads the
+# auth log. Confining what it may READ would not harden it, it would blind it —
+# a scanner that cannot see the files it is asked about is not a safer scanner,
+# it is a useless one.
+#
+# So reads are broad and WRITES are narrow. What this profile actually prevents
+# is a compromised Sentry modifying the system it was asked to inspect.
+abi <abi/3.0>,
+
+include <tunables/global>
+
+profile grt-sentry /usr/bin/grt-sentry {
+  include <abstractions/base>
+  include <abstractions/X>
+  include <abstractions/fonts>
+  include <abstractions/freedesktop.org>
+  include <abstractions/dbus-session-strict>
+  include <abstractions/mesa>
+  include <abstractions/nameservice>
+  include <abstractions/openssl>
+  include <abstractions/ssl_certs>
+
+  # Network is allowed because VirusTotal lookups exist, and refused at the
+  # firewall instead when they are turned off: /etc/nftables.d/50-sentry-vt-
+  # output.nft is written only if the person enabled them. Two layers that
+  # disagree would mean one of them is a lie, so the decision lives in one
+  # place — the firewall — and this profile does not duplicate it.
+  network inet stream,
+  network inet6 stream,
+  deny network inet dgram,
+  deny network netlink raw,
+  deny network packet,
+
+  /usr/bin/grt-sentry mr,
+  /usr/share/grt-sentry/{,**} r,
+  /usr/share/applications/{,*} r,
+  /usr/share/icons/{,**} r,
+  /usr/share/glib-2.0/schemas/{,*} r,
+
+  /usr/libexec/webkit2gtk-4.1/* ix,
+  /usr/lib/@{multiarch}/webkit2gtk-4.1/** mr,
+  /usr/bin/bwrap ix,
+
+  # Reading, widely: this is the job.
+  / r,
+  /**/ r,
+  /home/** r,
+  /etc/** r,
+  /usr/** r,
+  /var/log/{auth.log,auth.log.*,wtmp,btmp} r,
+  /var/lib/dpkg/{status,status-old} r,
+
+  # Writing, narrowly: its own database, its own config, and quarantine.
+  owner @{HOME}/.config/grt-sentry/{,**} rwk,
+  owner @{HOME}/.cache/grt-sentry/{,**} rwk,
+  owner @{HOME}/.local/share/grt-sentry/{,**} rwk,
+  owner @{HOME}/.local/share/grt-sentry/quarantine/{,**} rwk,
+
+  # Quarantine moves a file out of harm's way, so it has to be able to take it
+  # from where it was. Nothing else in the home may be written.
+  owner @{HOME}/** w,
+
+  deny @{HOME}/.ssh/** w,
+  deny @{HOME}/.gnupg/** w,
+  deny /etc/** w,
+  deny /usr/** w,
+  deny /boot/** rw,
+
+  # The two things that need root go through pkexec, which runs outside this
+  # profile and asks the person.
+  /usr/bin/pkexec Px,
+
+  # Showing a file in whatever the person uses for it. Leaves the confinement
+  # deliberately: the handler is theirs, not this profile's business.
+  /usr/bin/xdg-open Ux,
+  /usr/bin/gio Ux,
+
+  # File dialogs go through the XDG desktop portal on the session bus.
+  # dbus-session-strict allows the connection and no traffic, so without these
+  # choosing a folder to scan silently does nothing.
+  dbus send bus=session path=/org/freedesktop/portal/{desktop,documents}
+       interface=org.freedesktop.portal.*
+       peer=(name=org.freedesktop.portal.Desktop),
+  dbus receive bus=session path=/org/freedesktop/portal/{desktop,documents}
+       interface=org.freedesktop.portal.*
+       peer=(name=org.freedesktop.portal.Desktop),
+  dbus send bus=session path=/org/freedesktop/DBus
+       interface=org.freedesktop.DBus
+       member={Hello,GetNameOwner,NameHasOwner,AddMatch,RemoveMatch}
+       peer=(name=org.freedesktop.DBus),
+  owner /run/user/@{uid}/doc/{,**} rw,
+
+  # Its directories are grt-sentry, fixed in paths.rs as APP_DIR, and not
+  # derived from the identifier the way the Tauri default is. Checked rather
+  # than assumed: the other nine profiles had it the other way round and would
+  # have cut their applications off from their own data.
+
+  # Sockets to processes: one pass over /proc, which is where that mapping is.
+  @{PROC}/ r,
+  @{PROC}/** r,
+  @{PROC}/sys/kernel/random/boot_id r,
+
+  /sys/devices/system/cpu/{,**} r,
+  /sys/fs/cgroup/** r,
+  /dev/dri/* rw,
+
+  owner /run/user/@{uid}/{,**} rw,
+  owner /tmp/{,**} rw,
+  owner /dev/shm/** rw,
+}
