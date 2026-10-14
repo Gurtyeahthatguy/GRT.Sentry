@@ -1,6 +1,6 @@
 [package]
 name = "grt-sentry"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local security scanner: checks files, connections and system state on demand"
 authors = ["GRT Project"]
 license = "MIT"
