@@ -109,6 +109,12 @@ pub fn is_executable(_metadata: &Metadata) -> bool {
     false
 }
 
+/// Windows has no change time a program cannot set, so the modification time
+/// stands in.
+pub fn change_time(metadata: &Metadata) -> i64 {
+    crate::scanner::modified_at(metadata)
+}
+
 /// 1 when the file was read-only, 0 otherwise. Restoring reads it back.
 pub fn permission_bits(metadata: &Metadata) -> u32 {
     u32::from(metadata.permissions().readonly())
@@ -585,6 +591,17 @@ pub fn injected_libraries() -> Option<(String, Vec<String>)> {
 /// claim these are security fixes.
 pub fn updates_heading() -> &'static str {
     "These packages have a newer version available"
+}
+
+// --- packaged files -------------------------------------------------------
+
+/// Windows installers keep no hash of what they put on the disk.
+pub fn package_manifest() -> Option<Result<(crate::packages::Manager, Vec<crate::packages::PackagedFile>), String>> {
+    None
+}
+
+pub fn package_check_note() -> &'static str {
+    "Windows keeps no record of what its installers put on the disk, so there is nothing to compare system programs against. Checking their signatures instead is not done yet."
 }
 
 // --- what starts by itself ------------------------------------------------

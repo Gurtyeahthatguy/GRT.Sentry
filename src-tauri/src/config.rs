@@ -27,6 +27,13 @@ pub struct Config {
     /// When false, only executables and archives are considered.
     pub deep_scan: bool,
 
+    /// Folders with these names are not walked. A folder holding a
+    /// CACHEDIR.TAG, which build tools leave in their output, is skipped too.
+    pub skip_folders: Vec<String>,
+
+    /// Compare system programs with what their packages installed.
+    pub check_packages: bool,
+
     /// Quarantine automatically above this many detections. Off by default.
     pub auto_quarantine: bool,
     pub auto_quarantine_threshold: u32,
@@ -68,6 +75,8 @@ impl Default for Config {
             scan_paths: platform::default_scan_paths(),
             max_file_size_mb: 100,
             deep_scan: false,
+            skip_folders: default_skip_folders(),
+            check_packages: true,
             auto_quarantine: false,
             auto_quarantine_threshold: 10,
             vt_interval_seconds: 15,
@@ -81,6 +90,12 @@ impl Default for Config {
             theme: "system".to_string(),
         }
     }
+}
+
+/// Folders full of generated files, which a scan would otherwise queue by the
+/// thousand.
+pub fn default_skip_folders() -> Vec<String> {
+    [".git", "node_modules", ".cache", "__pycache__", ".venv"].iter().map(|s| s.to_string()).collect()
 }
 
 impl Config {
@@ -152,6 +167,8 @@ pub struct ConfigView {
     pub scan_paths: Vec<String>,
     pub max_file_size_mb: u64,
     pub deep_scan: bool,
+    pub skip_folders: Vec<String>,
+    pub check_packages: bool,
     pub auto_quarantine: bool,
     pub auto_quarantine_threshold: u32,
     pub vt_interval_seconds: u64,
@@ -177,6 +194,8 @@ impl From<&Config> for ConfigView {
             scan_paths: c.scan_paths.clone(),
             max_file_size_mb: c.max_file_size_mb,
             deep_scan: c.deep_scan,
+            skip_folders: c.skip_folders.clone(),
+            check_packages: c.check_packages,
             auto_quarantine: c.auto_quarantine,
             auto_quarantine_threshold: c.auto_quarantine_threshold,
             vt_interval_seconds: c.vt_interval_seconds,
@@ -203,6 +222,8 @@ pub struct ConfigUpdate {
     pub scan_paths: Option<Vec<String>>,
     pub max_file_size_mb: Option<u64>,
     pub deep_scan: Option<bool>,
+    pub skip_folders: Option<Vec<String>>,
+    pub check_packages: Option<bool>,
     pub auto_quarantine: Option<bool>,
     pub auto_quarantine_threshold: Option<u32>,
     pub vt_interval_seconds: Option<u64>,
@@ -231,6 +252,17 @@ impl ConfigUpdate {
         }
         if let Some(v) = self.deep_scan {
             config.deep_scan = v;
+        }
+        if let Some(names) = self.skip_folders {
+            // A name, not a path: "a/b" would never match one folder.
+            config.skip_folders = names
+                .into_iter()
+                .map(|n| n.trim().trim_matches('/').to_string())
+                .filter(|n| !n.is_empty() && !n.contains('/') && !n.contains('\\'))
+                .collect();
+        }
+        if let Some(v) = self.check_packages {
+            config.check_packages = v;
         }
         if let Some(v) = self.auto_quarantine {
             config.auto_quarantine = v;
@@ -308,6 +340,24 @@ mod tests {
         let mut config = Config::default();
         ConfigUpdate { vt_interval_seconds: Some(0), ..Default::default() }.apply(&mut config);
         assert_eq!(config.vt_interval_seconds, 15);
+    }
+
+    #[test]
+    fn a_configuration_from_before_the_skip_list_gets_the_default_one() {
+        let config: Config = toml::from_str("deep_scan = true\n").unwrap();
+        assert_eq!(config.skip_folders, default_skip_folders());
+        assert!(config.check_packages);
+    }
+
+    #[test]
+    fn folders_to_skip_are_names_and_never_paths() {
+        let mut config = Config::default();
+        ConfigUpdate {
+            skip_folders: Some(vec![" target/ ".into(), "a/b".into(), "".into(), "dist".into()]),
+            ..Default::default()
+        }
+        .apply(&mut config);
+        assert_eq!(config.skip_folders, vec!["target".to_string(), "dist".to_string()]);
     }
 
     #[test]

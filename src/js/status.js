@@ -69,7 +69,7 @@ async function checkOneFile() {
   const chosen = await dialog.open({ multiple: false, title: "Choose a file to check" });
   if (!chosen) return;
 
-  toast("Hashing the file and asking VirusTotal…");
+  toast("Reading the file and checking it…");
   try {
     const report = await api.scanFile(chosen);
     describeFileReport(report);
@@ -85,20 +85,36 @@ function describeFileReport(report) {
   card.append(el("div", "issue-title", report.path.split("/").pop()));
   card.append(el("div", "issue-location", report.path));
 
-  let summary;
+  const lines = [];
   if (report.trusted) {
-    summary = "You have marked this file as trusted, so it is not reported.";
-  } else if (!report.known) {
-    summary = "VirusTotal has never seen this file. That is normal for something you made yourself.";
-  } else if (report.malicious === 0) {
-    summary = report.total ? `No engine flags it, out of ${report.total}.` : "No engine flags it.";
-  } else {
-    summary = report.total
-      ? `${report.malicious} of ${report.total} engines flag it.`
-      : `${report.malicious} engines flag it.`;
+    lines.push("You have marked this file as trusted, so it is not reported.");
   }
 
-  card.append(el("div", "issue-detail", `${summary}\n${formatSize(report.size)}\nSHA-256: ${report.sha256}`));
+  if (report.rule_hits.length === 0) {
+    lines.push("No rule matches it.");
+  } else {
+    const count = report.rule_hits.length;
+    lines.push(`${count} rule${count === 1 ? "" : "s"} match${count === 1 ? "es" : ""} it.`);
+  }
+  if (report.members > 0) {
+    lines.push(`It is an archive, and ${formatCount(report.members)} file${report.members === 1 ? " was" : "s were"} looked at inside.`);
+  }
+  for (const sentence of report.unchecked) lines.push(sentence);
+
+  if (!report.asked_virustotal) {
+    lines.push("VirusTotal was not asked, because no API key is set.");
+  } else if (!report.known) {
+    lines.push("VirusTotal has never seen this file. That is normal for something you made yourself.");
+  } else if (report.malicious === 0) {
+    lines.push(report.total ? `No engine flags it, out of ${report.total}.` : "No engine flags it.");
+  } else {
+    lines.push(
+      report.total ? `${report.malicious} of ${report.total} engines flag it.` : `${report.malicious} engines flag it.`
+    );
+  }
+
+  lines.push(formatSize(report.size), `SHA-256: ${report.sha256}`);
+  card.append(el("div", "issue-detail", lines.join("\n")));
   nodes.issues.append(card);
 
   if (report.issue) {
@@ -137,6 +153,7 @@ function showProgress(progress) {
     autostart: "Startup entries",
     logins: "Logins",
     integrity: "System files",
+    packages: "System programs",
     done: "Finishing",
   }[progress.phase] || progress.phase;
 
@@ -154,7 +171,7 @@ function render(status) {
     nodes.mark.className = "verdict-mark is-clean";
     nodes.line.textContent = status.last_scan ? "Nothing needs attention" : "Not scanned yet";
     nodes.detail.textContent = status.last_scan
-      ? "Files, connections, updates, startup entries and system files were all checked."
+      ? "Files, connections, updates, startup entries, system files and system programs were all checked."
       : "Press Scan now to check this machine.";
   } else {
     nodes.mark.className = `verdict-mark is-${worst}`;

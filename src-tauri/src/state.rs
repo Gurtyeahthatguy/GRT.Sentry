@@ -43,6 +43,12 @@ pub enum IssueKind {
     UnknownAutostartEntry,
     FailedLoginAttempts,
     IntegrityChanged,
+    /// A file that matched one of GRT Sentry's own rules.
+    RuleMatch,
+    /// An archive a limit or a password kept from being checked completely.
+    UncheckedArchive,
+    /// A system program whose contents differ from what its package installed.
+    PackageMismatch,
     /// A module could not run, for want of a key or a permission.
     ModuleUnavailable,
 }
@@ -104,6 +110,7 @@ pub enum IssueTarget {
     File { path: String, sha256: String },
     Connection { ip: String, pid: Option<i32>, process: Option<String> },
     Integrity { path: String, current_hash: String },
+    Package { path: String, digest: String },
     Autostart { key: String, name: String },
     Packages { names: Vec<String> },
     LoginAttempts { ip: String },

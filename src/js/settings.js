@@ -35,6 +35,8 @@ function fill(config) {
   document.getElementById("scan-paths").value = config.scan_paths.join("\n");
   document.getElementById("max-size").value = config.max_file_size_mb;
   document.getElementById("deep-scan").checked = config.deep_scan;
+  document.getElementById("skip-folders").value = config.skip_folders.join("\n");
+  document.getElementById("check-packages").checked = config.check_packages;
   document.getElementById("scan-on-startup").checked = config.scan_on_startup;
   document.getElementById("watch-folders").checked = config.watch_folders;
   document.getElementById("auto-quarantine").checked = config.auto_quarantine;
@@ -67,6 +69,8 @@ async function save(onThemeChange) {
     integrity_paths: lines("integrity-paths"),
     max_file_size_mb: number("max-size"),
     deep_scan: document.getElementById("deep-scan").checked,
+    skip_folders: lines("skip-folders"),
+    check_packages: document.getElementById("check-packages").checked,
     scan_on_startup: document.getElementById("scan-on-startup").checked,
     auto_quarantine: document.getElementById("auto-quarantine").checked,
     auto_quarantine_threshold: number("auto-threshold"),
@@ -177,6 +181,7 @@ async function loadFacts() {
     ["configuration", info.config_path],
     ["quarantine", info.quarantine_path],
     ["files in cache", formatCount(info.cached_files)],
+    ["detection rules", `${formatCount(info.rule_count)}, version ${info.rules_version}`],
     ["files in quarantine", formatCount(info.quarantined_files)],
     ["geolocation data", info.geoip_available ? info.geoip_path : "not installed, so connections show no place"],
     [

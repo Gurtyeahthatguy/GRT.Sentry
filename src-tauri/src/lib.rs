@@ -15,15 +15,18 @@ mod authlog;
 mod autostart;
 mod cli;
 mod config;
+mod content;
 mod dashboard;
 mod db;
 mod geoip;
 mod integrity;
 mod netmon;
+mod packages;
 mod paths;
 mod platform;
 mod quarantine;
 mod resolve;
+mod rules;
 mod scanner;
 mod schedule;
 mod state;
@@ -87,11 +90,17 @@ struct FileReport {
     path: String,
     sha256: String,
     size: u64,
+    /// False when there is no key, so VirusTotal was not asked.
+    asked_virustotal: bool,
     /// Engines flagging it, when there is an answer.
     malicious: Option<u32>,
     total: Option<u32>,
     known: bool,
     trusted: bool,
+    /// What GRT Sentry's own rules found, and what an archive kept from view.
+    rule_hits: Vec<rules::RuleHit>,
+    unchecked: Vec<String>,
+    members: u32,
     /// Present when the file is worth reporting, and carries the actions.
     issue: Option<Issue>,
 }
@@ -119,37 +128,37 @@ async fn scan_file(state: State<'_, AppState>, path: String) -> Result<FileRepor
         (db::is_allowed(&conn, &sha256), db::verdict_for_hash(&conn, &sha256, 0))
     };
 
-    let (api_key, interval) = {
+    let (api_key, interval, limits) = {
         let config = state.config.lock().unwrap();
-        (config.api_key(), config.vt_interval_seconds)
+        (config.api_key(), config.vt_interval_seconds, content::Limits::for_config(&config))
     };
 
+    let inspect_path = target.clone();
+    let report = tokio::task::spawn_blocking(move || content::inspect(&inspect_path, &limits))
+        .await
+        .map_err(|e| format!("The file could not be inspected: {e}"))?;
+
     let verdict = match (cached, api_key) {
-        (Some(malicious), _) => scanner::VtVerdict {
+        (Some(malicious), _) => Some(scanner::VtVerdict {
             malicious: malicious.max(0) as u32,
             suspicious: 0,
             total: 0,
             known: true,
-        },
+        }),
         (None, Some(key)) => {
             let client = scanner::VtClient::new(key, &state.vt, Duration::from_secs(interval))?;
             let verdict = client.lookup(&sha256).await?;
             let conn = state.db.lock().unwrap();
             let _ = db::put_verdict(&conn, &sha256, verdict.malicious as i64);
-            verdict
+            Some(verdict)
         }
-        (None, None) => {
-            return Err(
-                "No VirusTotal API key is set, so there is nothing to compare this file against. The key goes in Settings."
-                    .to_string(),
-            )
-        }
+        (None, None) => None,
     };
 
     let issue = if trusted {
         None
     } else {
-        scanner::file_finding(&path, &sha256, &verdict, false).map(|finding| {
+        scanner::file_finding(&path, &sha256, verdict.as_ref(), &report, false).map(|finding| {
             let mut snapshot = state.snapshot.lock().unwrap();
             snapshot.targets.insert(finding.issue.id.clone(), finding.target);
             finding.issue
@@ -160,10 +169,14 @@ async fn scan_file(state: State<'_, AppState>, path: String) -> Result<FileRepor
         path,
         sha256,
         size,
-        malicious: verdict.known.then_some(verdict.malicious),
-        total: (verdict.total > 0).then_some(verdict.total),
-        known: verdict.known,
+        asked_virustotal: verdict.is_some(),
+        malicious: verdict.as_ref().filter(|v| v.known).map(|v| v.malicious),
+        total: verdict.as_ref().map(|v| v.total).filter(|t| *t > 0),
+        known: verdict.as_ref().is_some_and(|v| v.known),
         trusted,
+        rule_hits: report.hits.clone(),
+        unchecked: report.unchecked.iter().map(|u| u.sentence()).collect(),
+        members: report.members,
         issue,
     })
 }
@@ -274,6 +287,10 @@ async fn resolve_issue(
         (IssueTarget::Integrity { path, current_hash }, "update_baseline") => {
             integrity::accept_current(&conn, path, current_hash)?;
             format!("The current contents of {path} are the new reference.")
+        }
+        (IssueTarget::Package { path, digest }, "update_baseline") => {
+            packages::accept(&conn, path, digest)?;
+            format!("{path} will not be reported again unless it changes.")
         }
 
         (IssueTarget::Autostart { key, name }, "trust") => {
@@ -441,6 +458,8 @@ struct SystemInfo {
     config_path: String,
     quarantine_path: String,
     cached_files: i64,
+    rule_count: usize,
+    rules_version: String,
     quarantined_files: usize,
     recent_scans: Vec<ScanRecord>,
     schedule: schedule::ScheduleStatus,
@@ -464,6 +483,8 @@ fn system_info(state: State<'_, AppState>, watcher_state: State<'_, WatcherState
         config_path: paths::config_path().to_string_lossy().into_owned(),
         quarantine_path: paths::quarantine_dir().to_string_lossy().into_owned(),
         cached_files: db::cached_file_count(&conn),
+        rule_count: rules::count(),
+        rules_version: rules::version().to_string(),
         quarantined_files: db::list_quarantine(&conn).map(|q| q.len()).unwrap_or(0),
         recent_scans: db::recent_scans(&conn, 10).unwrap_or_default(),
         schedule: schedule::status(),

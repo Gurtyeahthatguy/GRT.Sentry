@@ -1,14 +1,4 @@
 node_modules/
-dist/
-target/
-*.AppImage
-*.deb
-*.rpm
-*.map
+src-tauri/target/
+src-tauri/gen/schemas/
 src-tauri/resources/*.mmdb
-tests/tmp/
-src-tauri/icons/ios/
-.DS_Store
-*~
-.idea/
-.vscode/

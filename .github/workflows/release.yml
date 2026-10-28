@@ -68,6 +68,10 @@ jobs:
         if: runner.os == 'Linux'
         run: ./scripts/check-build.sh src-tauri/target/release/grt-sentry
 
+      - name: Weight check
+        shell: bash
+        run: ./scripts/check-weight.sh
+
       # Tauri names its output after the product, spaces included. Rename to
       # one shape.
       - name: Collect
@@ -130,9 +134,11 @@ jobs:
             echo "there, so start it with Run as administrator when you want"
             echo "those."
             echo
-            echo "Two optional steps after installing, both in the README:"
-            echo "a free VirusTotal key to check files against the engines,"
-            echo "and \`scripts/setup-nftables.sh\` to make blocking work."
+            echo "Files are checked offline against GRT Sentry's own rules,"
+            echo "with no key and no network. Two optional steps after"
+            echo "installing, both in the README: a free VirusTotal key, which"
+            echo "adds the engines' verdicts to the rules, and"
+            echo "\`scripts/setup-nftables.sh\` to make blocking work."
             echo
             echo "The geolocation database is not distributed here, because"
             echo "MaxMind licenses it separately. \`scripts/fetch-geoip.sh\`"

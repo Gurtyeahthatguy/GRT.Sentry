@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::paths;
 
 /// Bumped when the schema changes in a way that needs migrating.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Seconds since the epoch.
 pub fn now() -> i64 {
@@ -134,11 +134,30 @@ fn apply_schema(conn: &Connection) -> Result<(), String> {
             reverted   INTEGER NOT NULL DEFAULT 0
         );
 
+        -- What each in-scope packaged file hashed to, keyed by size and change time.
+        CREATE TABLE IF NOT EXISTS package_cache (
+            path    TEXT PRIMARY KEY,
+            size    INTEGER NOT NULL,
+            ctime   INTEGER NOT NULL,
+            digest  TEXT NOT NULL
+        );
+
+        -- Packaged files that differ from their package on purpose.
+        CREATE TABLE IF NOT EXISTS package_accepted (
+            path        TEXT PRIMARY KEY,
+            digest      TEXT NOT NULL,
+            accepted_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS action_log_time ON action_log (timestamp DESC);
         CREATE INDEX IF NOT EXISTS scan_history_time ON scan_history (timestamp DESC);
         "#,
     )
     .map_err(wrap)?;
+
+    // Version 2: what the rules found in a file, and which rules found it.
+    add_column(conn, "file_cache", "content", "TEXT")?;
+    add_column(conn, "file_cache", "content_version", "TEXT")?;
 
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -150,6 +169,18 @@ fn apply_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// Adds a column to a table that predates it.
+fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<(), String> {
+    let exists = conn
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))
+        .and_then(|mut stmt| stmt.exists(params![column]))
+        .map_err(wrap)?;
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}")).map_err(wrap)?;
+    }
+    Ok(())
+}
+
 // --- file cache -----------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -158,12 +189,15 @@ pub struct CachedFile {
     /// Engines that called it malicious, or `None` if never asked.
     pub vt_verdict: Option<i64>,
     pub vt_checked: Option<i64>,
+    /// What the rules found, as JSON, and the rules version that found it.
+    pub content: Option<String>,
+    pub content_version: Option<String>,
 }
 
 /// The cached record for a file, if path, size and mtime all still match.
 pub fn cached_file(conn: &Connection, path: &str, size: u64, mtime: i64) -> Option<CachedFile> {
     conn.query_row(
-        "SELECT sha256, vt_verdict, vt_checked FROM file_cache
+        "SELECT sha256, vt_verdict, vt_checked, content, content_version FROM file_cache
          WHERE path = ?1 AND size = ?2 AND mtime = ?3",
         params![path, size as i64, mtime],
         |row| {
@@ -171,6 +205,8 @@ pub fn cached_file(conn: &Connection, path: &str, size: u64, mtime: i64) -> Opti
                 sha256: row.get(0)?,
                 vt_verdict: row.get(1)?,
                 vt_checked: row.get(2)?,
+                content: row.get(3)?,
+                content_version: row.get(4)?,
             })
         },
     )
@@ -191,7 +227,11 @@ pub fn put_file(conn: &Connection, path: &str, sha256: &str, size: u64, mtime: i
              vt_verdict = CASE WHEN file_cache.sha256 = excluded.sha256
                                THEN file_cache.vt_verdict ELSE NULL END,
              vt_checked = CASE WHEN file_cache.sha256 = excluded.sha256
-                               THEN file_cache.vt_checked ELSE NULL END",
+                               THEN file_cache.vt_checked ELSE NULL END,
+             content = CASE WHEN file_cache.sha256 = excluded.sha256
+                            THEN file_cache.content ELSE NULL END,
+             content_version = CASE WHEN file_cache.sha256 = excluded.sha256
+                                    THEN file_cache.content_version ELSE NULL END",
         params![path, sha256, size as i64, mtime],
     )
     .map_err(wrap)?;
@@ -223,6 +263,16 @@ pub fn verdict_for_hash(conn: &Connection, sha256: &str, max_age_secs: i64) -> O
     .ok()
     .flatten()
     .flatten()
+}
+
+/// Stores what the rules found in a file.
+pub fn put_content(conn: &Connection, path: &str, version: &str, content: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE file_cache SET content = ?2, content_version = ?3 WHERE path = ?1",
+        params![path, content, version],
+    )
+    .map_err(wrap)?;
+    Ok(())
 }
 
 /// Drops a path from the cache.
@@ -480,6 +530,48 @@ pub fn set_baseline(conn: &Connection, path: &str, sha256: &str) -> Result<(), S
     Ok(())
 }
 
+// --- package check --------------------------------------------------------
+
+/// The digest a packaged file had when its size and change time were these.
+pub fn package_digest(conn: &Connection, path: &str, size: u64, ctime: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT digest FROM package_cache WHERE path = ?1 AND size = ?2 AND ctime = ?3",
+        params![path, size as i64, ctime],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+pub fn put_package_digest(conn: &Connection, path: &str, size: u64, ctime: i64, digest: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO package_cache (path, size, ctime, digest) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path) DO UPDATE SET size = excluded.size, ctime = excluded.ctime, digest = excluded.digest",
+        params![path, size as i64, ctime, digest],
+    )
+    .map_err(wrap)?;
+    Ok(())
+}
+
+/// The contents the user confirmed for a file that differs from its package.
+pub fn package_accepted(conn: &Connection, path: &str) -> Option<String> {
+    conn.query_row("SELECT digest FROM package_accepted WHERE path = ?1", params![path], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+pub fn accept_package_file(conn: &Connection, path: &str, digest: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO package_accepted (path, digest, accepted_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET digest = excluded.digest, accepted_at = excluded.accepted_at",
+        params![path, digest, now()],
+    )
+    .map_err(wrap)?;
+    Ok(())
+}
+
 // --- autostart baseline ---------------------------------------------------
 
 pub fn autostart_is_known(conn: &Connection, key: &str) -> bool {
@@ -623,6 +715,42 @@ mod tests {
 
         assert_eq!(verdict_for_hash(&conn, "shared", 86_400), Some(7));
         assert_eq!(cached_file(&conn, "/tmp/two.bin", 10, 2).unwrap().vt_verdict, Some(7));
+    }
+
+    #[test]
+    fn what_the_rules_found_goes_with_the_contents_it_describes() {
+        let conn = open_memory();
+        put_file(&conn, "/tmp/a.sh", "hash-1", 10, 1).unwrap();
+        put_content(&conn, "/tmp/a.sh", "v1", "{}").unwrap();
+        assert_eq!(cached_file(&conn, "/tmp/a.sh", 10, 1).unwrap().content_version.as_deref(), Some("v1"));
+
+        put_file(&conn, "/tmp/a.sh", "hash-1", 10, 2).unwrap();
+        assert_eq!(cached_file(&conn, "/tmp/a.sh", 10, 2).unwrap().content.as_deref(), Some("{}"));
+
+        put_file(&conn, "/tmp/a.sh", "hash-2", 11, 3).unwrap();
+        assert!(cached_file(&conn, "/tmp/a.sh", 11, 3).unwrap().content.is_none());
+    }
+
+    #[test]
+    fn a_database_from_before_the_rules_gains_the_new_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE file_cache (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
+                 mtime INTEGER NOT NULL, vt_verdict INTEGER, vt_checked INTEGER);
+                 INSERT INTO file_cache VALUES ('/tmp/x', 'h', 1, 1, 3, 100);",
+            )
+            .unwrap();
+        }
+        let conn = open_at(&path).unwrap();
+        let cached = cached_file(&conn, "/tmp/x", 1, 1).unwrap();
+        assert_eq!(cached.vt_verdict, Some(3));
+        assert!(cached.content.is_none());
+        // Opening twice must not try to add the columns again.
+        drop(conn);
+        open_at(&path).unwrap();
     }
 
     #[test]

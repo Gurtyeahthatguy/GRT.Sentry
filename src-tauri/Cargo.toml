@@ -1,6 +1,6 @@
 [package]
 name = "grt-sentry"
-version = "0.1.2"
+version = "0.2.0"
 description = "Local security scanner: checks files, connections and system state on demand"
 authors = ["GRT Project"]
 license = "MIT"
@@ -30,6 +30,18 @@ uuid = { version = "1", features = ["v4"] }
 notify = "6"
 toml = "0.8"
 chrono = "0.4"
+
+# Our own rules, compiled at start and run against file contents offline.
+yara-x = { version = "1.22", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp"] }
+
+# Archives, opened in memory with limits and never extracted to disk.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+sevenz-rust2 = { version = "0.24", default-features = false }
+
+# dpkg records MD5, so the package check needs it.
+md-5 = "0.10"
 
 # Reading /proc, which is where Linux keeps the socket table.
 [target.'cfg(not(windows))'.dependencies]
@@ -61,6 +73,8 @@ features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Writing 7z archives, for the tests that open them.
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress"] }
 # `test-util` gives the tests a clock they can fast-forward.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
 

@@ -50,3 +50,11 @@ http://cps.root-x1.letsencrypt.org
 # rustls points at its own documentation in the message it prints when TLS
 # configuration is wrong. A sentence in an error, not a request.
 https://docs.rs/rustls
+
+# yara-x, which runs the detection rules, and wasmtime, which runs what yara-x
+# compiles them to, cite their documentation and issue trackers in error
+# messages. The Microsoft link is a comment on the PE header layout.
+https://virustotal.github.io/yara-x/docs/
+https://bytecodealliance.org/security
+https://github.com/bytecodealliance/wasmtime/issues/
+https://learn.microsoft.com/en-us/windows/win32/api/winnt/

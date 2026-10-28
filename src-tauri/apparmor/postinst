@@ -1,10 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 # Load the profile now, rather than at the next reboot.
-#
-# Without this the .deb installs a file and nothing reads it: the confinement
-# the release promises starts applying whenever AppArmor is next reloaded,
-# which is not what "installed" suggests.
 set -e
 if [ "$1" = "configure" ] && command -v apparmor_parser >/dev/null 2>&1; then
     if [ -d /sys/kernel/security/apparmor ]; then

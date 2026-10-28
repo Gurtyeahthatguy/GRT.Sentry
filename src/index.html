@@ -144,6 +144,12 @@
           <input type="number" id="max-size" min="1" max="4096" />
         </div>
 
+        <div class="field">
+          <label for="skip-folders">Skip folders with these names, one per line</label>
+          <textarea id="skip-folders" rows="4" spellcheck="false"></textarea>
+          <p class="hint dim">Folders holding a CACHEDIR.TAG, which build tools leave in their output, are skipped as well.</p>
+        </div>
+
         <label class="check"><input type="checkbox" id="deep-scan" /> Check every file, not only programs and archives</label>
         <label class="check"><input type="checkbox" id="scan-on-startup" /> Scan when the window opens</label>
         <label class="check"><input type="checkbox" id="watch-folders" /> Watch those folders and say when something new arrives</label>
@@ -182,6 +188,7 @@
           <label for="integrity-paths">System files to watch, one per line</label>
           <textarea id="integrity-paths" rows="5" spellcheck="false"></textarea>
         </div>
+        <label class="check"><input type="checkbox" id="check-packages" /> Compare system programs with what their packages installed</label>
 
         <h2>Connections</h2>
         <div class="field">

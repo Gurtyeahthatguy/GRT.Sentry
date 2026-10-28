@@ -1,6 +1,6 @@
 # Installing GRT Sentry
 
-The program is at version **0.1.2**, and the same version runs on Linux and on
+The program is at version **0.2.0**, and the same version runs on Linux and on
 Windows.
 
 ---
@@ -14,19 +14,19 @@ be installed to use them.
 no administrator rights, and it runs from anywhere:
 
 ```bash
-chmod +x grt-sentry-0.1.2-linux-x86_64.AppImage
-./grt-sentry-0.1.2-linux-x86_64.AppImage
+chmod +x grt-sentry-0.2.0-linux-x86_64.AppImage
+./grt-sentry-0.2.0-linux-x86_64.AppImage
 ```
 
 The `.deb` and `.rpm` beside it install through the package manager instead,
 which puts the program in the application menu:
 
 ```bash
-sudo apt install ./grt-sentry-0.1.2-linux-x86_64.deb     # Debian, Ubuntu
-sudo dnf install ./grt-sentry-0.1.2-linux-x86_64.rpm     # Fedora
+sudo apt install ./grt-sentry-0.2.0-linux-x86_64.deb     # Debian, Ubuntu
+sudo dnf install ./grt-sentry-0.2.0-linux-x86_64.rpm     # Fedora
 ```
 
-**Windows.** Take `grt-sentry-0.1.2-windows-x86_64-setup.exe`. The plain `.exe`
+**Windows.** Take `grt-sentry-0.2.0-windows-x86_64-setup.exe`. The plain `.exe`
 beside it is the same program with no installer, for a portable copy. Neither
 is code-signed, so Windows will warn about an unknown publisher.
 
@@ -80,7 +80,10 @@ On Linux, to put a locally built copy in the application menu without root:
 Everything below is optional. The program runs without any of it and says which
 checks are unavailable.
 
-### A VirusTotal key, for the file scanner
+### A VirusTotal key, for a second opinion on files
+
+Files are checked against GRT Sentry's own rules without a key. A key adds the
+verdicts of VirusTotal's engines on top of them.
 
 Register at virustotal.com, copy the key from your profile, and paste it into
 Settings. It is stored in the configuration file, which is written with mode

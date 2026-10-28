@@ -1,0 +1,6 @@
+# kind kilobytes: the largest each file may be, built without the GeoLite2 database
+binary 17600
+deb 7900
+rpm 7900
+appimage 89600
+setup 7000

@@ -119,6 +119,12 @@ pub fn is_executable(metadata: &Metadata) -> bool {
     metadata.mode() & 0o111 != 0
 }
 
+/// When the inode last changed, which unlike the modification time cannot be
+/// set back from user space.
+pub fn change_time(metadata: &Metadata) -> i64 {
+    metadata.ctime()
+}
+
 pub fn permission_bits(metadata: &Metadata) -> u32 {
     metadata.permissions().mode() & 0o7777
 }
@@ -525,6 +531,25 @@ pub fn injected_libraries() -> Option<(String, Vec<String>)> {
 /// What the list of pending updates is called here.
 pub fn updates_heading() -> &'static str {
     "These packages have a fix published in the security repository"
+}
+
+// --- packaged files -------------------------------------------------------
+
+/// What dpkg or rpm recorded about the files they installed, whichever this
+/// system has. `None` when it has neither.
+pub fn package_manifest() -> Option<Result<(crate::packages::Manager, Vec<crate::packages::PackagedFile>), String>> {
+    use crate::packages::{dpkg_manifest, parse_rpm_query, Manager, RPM_QUERY_FORMAT};
+
+    let info = Path::new("/var/lib/dpkg/info");
+    if info.is_dir() {
+        return Some(dpkg_manifest(info, Path::new("/")).map(|files| (Manager::Dpkg, files)));
+    }
+    which("rpm")?;
+    Some(run_plain("rpm", &["-qa", "--qf", RPM_QUERY_FORMAT]).map(|text| (Manager::Rpm, parse_rpm_query(&text))))
+}
+
+pub fn package_check_note() -> &'static str {
+    "Neither dpkg nor rpm keeps records on this system, so there is nothing to compare its programs against."
 }
 
 // --- what starts by itself ------------------------------------------------

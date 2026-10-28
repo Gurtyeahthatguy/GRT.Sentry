@@ -3,8 +3,11 @@
 A security scanner for the machine it runs on. It opens, checks, shows what it
 found, and offers something to do about each thing.
 
-- **Six checks, one answer.** Files, network connections, pending updates,
-  startup entries, failed logins, system file integrity.
+- **Seven checks, one answer.** Files, network connections, pending updates,
+  startup entries, failed logins, system file integrity, packaged programs.
+- **Offline first.** Files are judged by rules that ship with the program, and
+  archives are opened and judged too. VirusTotal adds its engines when given a
+  key; nothing depends on it.
 - **On demand.** Nothing runs in the background unless it is switched on.
 - **Reversible.** Quarantine before deletion, an undo log, and a firewall it
   drives rather than replaces.
@@ -17,7 +20,8 @@ Building and installing: [INSTALL.md](INSTALL.md).
 
 It belongs to the GRT family but is separate from [GRT
 Office](https://github.com/Gurtyeahthatguy/GRT.Office), which promises it never
-touches the network. This program asks VirusTotal about files.
+touches the network. This program asks VirusTotal about files, when it has a
+key.
 
 ## What leaves the machine
 
@@ -34,11 +38,29 @@ to. There is no telemetry, no update check and no analytics. See
 
 ## What it checks
 
-**Files.** Hashes what is in the download folders and asks VirusTotal how many
-engines flag each hash. A file whose size and modification time have not
-changed since last time is not read again. Ten or more detections is treated as
-malicious, one to nine as worth deciding about, and a file nobody has ever seen
-as neither.
+**Files.** Reads what is in the download folders and runs it through GRT
+Sentry's own rules: reverse shells, scripts that download and run something,
+persistence in cron, launchers and services, PHP web shells, encoded
+PowerShell, Windows script droppers, cryptocurrency miners, ransom notes, and
+the EICAR test file. The rules are [YARA](src-tauri/rules), run by
+[yara-x](https://github.com/VirusTotal/yara-x), and need no network and no key.
+
+Archives are opened in memory, never on disk: `.zip` (and `.jar`, `.apk` and
+the other formats that are zips underneath), `.tar`, `.gz`, `.tar.gz` and `.7z`.
+Every file inside is hashed and run through the rules, and an archive inside an
+archive is opened in turn, three levels down. A file that unpacks to more than
+two hundred times its compressed size is a decompression bomb and is reported
+as one, without being unpacked. Whatever a limit or a password kept from view
+is reported too, never skipped in silence.
+
+With a VirusTotal key, each file's hash is also looked up: ten or more engines
+is treated as malicious, one to nine as worth deciding about, and a file nobody
+has ever seen as neither. A file whose size and modification time have not
+changed since last time is not read again.
+
+Folders full of generated files are skipped: `.git`, `node_modules`, `.cache`,
+`__pycache__`, `.venv`, and any folder holding a `CACHEDIR.TAG`, which Cargo,
+pip and most build tools leave in their output. The list is in Settings.
 
 **Connections.** Reads the open sockets, matches each to the process that owns
 it, and marks the addresses this machine has never talked to before. Each
@@ -62,6 +84,13 @@ issue offers "this was expected", which makes the new contents the reference.
 It also reports a library forced into every process that starts, which is how a
 rootkit hides.
 
+**Packaged programs.** dpkg keeps an MD5 of every file it installs and rpm a
+SHA-256. Each program in `bin` and `sbin`, and each PAM module, which decides
+who may log in, is compared with that record. A replaced system program is found
+with no network and no signatures. Configuration files are left out, since
+editing them is what they are for. Only files whose size or change time moved
+are read again, so after the first scan the check costs a few milliseconds.
+
 ## Linux and Windows
 
 The two builds are the same program. What differs is who answers the questions,
@@ -69,7 +98,7 @@ and in two places the answer is narrower on Windows.
 
 | | Linux | Windows |
 |---|---|---|
-| Files, VirusTotal, quarantine, trusted list | the same | the same |
+| Files, rules, archives, VirusTotal, quarantine, trusted list | the same | the same |
 | Open connections | `/proc/net` | the Win32 socket table, **TCP only** |
 | Close one connection | `ss --kill` | `SetTcpEntry`, **IPv4 TCP only** |
 | Block an address | an nftables set | a Defender Firewall rule |
@@ -78,6 +107,7 @@ and in two places the answer is narrower on Windows.
 | Startup entries | desktop files, user units, cron | Run keys, Startup folder, scheduled tasks |
 | Pending updates | `apt`, security pocket only | `winget`, every pending upgrade |
 | Forced libraries | `/etc/ld.so.preload` | `AppInit_DLLs` |
+| Packaged programs | dpkg or rpm records | **not checked**: Windows keeps no record to compare against |
 | Scheduled scan | systemd user timer | Task Scheduler |
 | Administrator rights | `pkexec`, asked for per action | the whole program runs elevated, or not |
 
@@ -107,10 +137,13 @@ buttons. Destructive buttons ask for confirmation.
 | Problem | What is offered |
 |---|---|
 | A file engines flag | Quarantine, Delete, Trust this file, Ignore |
+| A file a rule matches, or an archive with one inside | Quarantine, Delete, Trust this file, Ignore |
+| An archive a limit or a password kept from view | Quarantine, Delete, Trust this file, Ignore |
 | A file nobody has seen | Send for analysis, Trust this file, Ignore |
 | A connection | Close connection, Stop process, Block address, Trust, Ignore |
 | Failed logins from an address | Block address, Expected, Ignore |
 | A changed system file | This was expected, Ignore |
+| A system program that differs from its package | This was expected, Ignore |
 | Pending updates | Show the whole list, Ignore |
 | A new startup entry | Expected, Ignore |
 
@@ -137,8 +170,8 @@ addresses. *Put back* restores a file to its original path, contents and
 permissions. *Undo* on a log line reverses a block or a quarantine. Nothing
 here deletes anything until *Delete for good* is pressed.
 
-**The Settings tab** holds the API key, the folders to scan, the thresholds and
-the scheduled scan. At the bottom it lists where everything lives and whether
+**The Settings tab** holds the API key, the folders to scan and to skip, the
+thresholds, the package check and the scheduled scan. At the bottom it lists where everything lives and whether
 the optional pieces are present.
 
 **A scheduled scan** runs the same checks without a window and notifies only
@@ -197,14 +230,36 @@ during a scan and nothing else.
 cd src-tauri && cargo test
 ```
 
-123 tests. Among them: a file is re-hashed when its size or modification time
-change and skipped when they do not; hashing a large file gives the same answer
-as hashing those bytes in one piece; VirusTotal requests are exactly the
-configured interval apart; a quarantined file crossing a filesystem boundary is
-copied, verified against its hash and only then removed; a private address is
-never treated as a stranger nor sent to a geolocation lookup; the filter that
-closes a connection matches that socket and no other; and a scan where every
-module is unavailable still produces a result.
+176 tests. Among them: with no key and no network, EICAR is found on its own
+and inside a zip; a zip, a gzip and a tar.gz bomb are each stopped and named,
+and an honest log file that compresses well is not; a replaced program in a fake
+dpkg tree is found and an untouched one is not; every rule has a sample it must
+match and the benign lookalikes it must not, such as the rustup installer line
+and a port check through `/dev/tcp`; a file is re-hashed when its size or
+modification time change and skipped when they do not; VirusTotal requests are
+exactly the configured interval apart; a quarantined file crossing a filesystem
+boundary is copied, verified against its hash and only then removed; and a scan
+where every module is unavailable still produces a result. No malware sample is
+stored anywhere: EICAR is built at run time, and the rest are a line or two of
+text.
+
+```bash
+./scripts/check-false-positives.sh
+```
+
+Runs the rules and the archive reader over every file under `/usr`, `/etc` and
+`/opt` and counts what they would report. The budget for a clean machine is
+zero, and it is checked on every push. On a desktop Debian install:
+190,000 files, 9 GB and 177,000 archive members in 83 seconds, no alarms, and
+171 MB of memory at the peak.
+
+```bash
+./scripts/check-weight.sh
+```
+
+Holds the binary and every package to [scripts/weight-budget.txt](scripts/weight-budget.txt).
+The rules engine is most of the weight: yara-x compiles rules to WebAssembly and
+brings wasmtime to run them.
 
 To look at the interface without building anything:
 
@@ -218,9 +273,14 @@ To look at the interface without building anything:
   first run records what starts automatically and what the system files contain
   now. On a machine already suspected of being compromised, investigate from
   outside it.
+- The rules are a few dozen, written for this program to catch the obvious
+  shapes. They are not a signature database and do not name malware families.
+  Something new and careful will match none of them.
 - VirusTotal knows about files, not behaviour. New malware is a file nobody has
   seen, which this reports as exactly that: an absence of information, not a
   clean bill of health.
+- The package check covers programs and PAM modules, not libraries. A replaced
+  `libc` is outside it.
 - The geolocation says where the network announcing an address is registered.
   That is a data centre or a provider, not a person and not a street.
 - Blocking an address stops this machine reaching it. It is an outbound rule,

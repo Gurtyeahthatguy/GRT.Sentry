@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use crate::state::{
     Action, AppState, Finding, Issue, IssueKind, IssueTarget, Severity, Snapshot, SystemStatus,
 };
-use crate::{authlog, autostart, db, integrity, netmon, scanner, updates};
+use crate::{authlog, autostart, db, integrity, netmon, packages, scanner, updates};
 
 /// Clears the "a scan is running" flag even if something panics.
 struct ScanGuard<'a>(&'a AppState);
@@ -24,8 +24,8 @@ impl Drop for ScanGuard<'_> {
     }
 }
 
-/// The full sequence: files, connections, updates, autostart, logins and
-/// integrity.
+/// The full sequence: files, connections, updates, autostart, logins,
+/// integrity and packages.
 ///
 /// `paths` overrides the configured directories.
 pub async fn scan(
@@ -130,6 +130,18 @@ pub async fn scan(
         findings.extend(integrity::findings(&conn, &config.integrity_paths));
     }
 
+    // 7. Packaged programs. Slow the first time, so the database is locked
+    // per file rather than for the whole pass.
+    if config.check_packages {
+        progress(scanner::ScanProgress {
+            phase: "packages".into(),
+            current: 0,
+            total: 0,
+            message: "Comparing system programs with their packages".into(),
+        });
+        findings.extend(packages::findings(&state.db, &state.cancel, progress));
+    }
+
     // Notes become issues, so nothing a module said is lost on the way out.
     for note in notes {
         findings.push(Finding::note(Issue {
@@ -207,6 +219,8 @@ mod tests {
                 // Nothing readable, so the module reports itself unavailable.
                 auth_log_path: "/nonexistent/auth.log".to_string(),
                 integrity_paths: vec![],
+                // Hashing every system program belongs to its own tests.
+                check_packages: false,
                 ..Default::default()
             }),
             snapshot: Mutex::new(Snapshot::default()),
