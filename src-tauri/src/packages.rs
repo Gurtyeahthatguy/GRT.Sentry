@@ -421,7 +421,9 @@ mod tests {
             std::fs::write(&path, on_disk).unwrap();
             md5sums.push_str(&format!("{}  {relative}\n", md5_of(recorded)));
         }
-        std::fs::write(info.join("fakeutils:amd64.md5sums"), md5sums).unwrap();
+        // A colon cannot be part of a file name on Windows.
+        let name = if cfg!(windows) { "fakeutils.md5sums" } else { "fakeutils:amd64.md5sums" };
+        std::fs::write(info.join(name), md5sums).unwrap();
         root
     }
 
