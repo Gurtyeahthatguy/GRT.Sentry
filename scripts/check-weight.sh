@@ -29,9 +29,12 @@ check() {
 }
 
 echo "Weight of grt-sentry"
-for binary in "$RELEASE/grt-sentry" "$RELEASE/grt-sentry.exe"; do
-  [[ -f "$binary" ]] && check binary "$binary"
-done
+# Git Bash on Windows also answers to the name without .exe, so the .exe goes first.
+if [[ -f "$RELEASE/grt-sentry.exe" ]]; then
+  check exe "$RELEASE/grt-sentry.exe"
+elif [[ -f "$RELEASE/grt-sentry" ]]; then
+  check binary "$RELEASE/grt-sentry"
+fi
 for file in "$RELEASE"/bundle/deb/*.deb; do [[ -f "$file" ]] && check deb "$file"; done
 for file in "$RELEASE"/bundle/rpm/*.rpm; do [[ -f "$file" ]] && check rpm "$file"; done
 for file in "$RELEASE"/bundle/appimage/*.AppImage; do [[ -f "$file" ]] && check appimage "$file"; done
