@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::paths;
 
 /// Bumped when the schema changes in a way that needs migrating.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Seconds since the epoch.
 pub fn now() -> i64 {
@@ -147,6 +147,16 @@ fn apply_schema(conn: &Connection) -> Result<(), String> {
             path        TEXT PRIMARY KEY,
             digest      TEXT NOT NULL,
             accepted_at INTEGER NOT NULL
+        );
+
+        -- What each check took as normal, by check: kernel modules, browser
+        -- extensions, accounts, files in watched folders.
+        CREATE TABLE IF NOT EXISTS baseline (
+            kind       TEXT NOT NULL,
+            key        TEXT NOT NULL,
+            value      TEXT NOT NULL,
+            first_seen INTEGER NOT NULL,
+            PRIMARY KEY (kind, key)
         );
 
         CREATE INDEX IF NOT EXISTS action_log_time ON action_log (timestamp DESC);
@@ -572,6 +582,40 @@ pub fn accept_package_file(conn: &Connection, path: &str, digest: &str) -> Resul
     Ok(())
 }
 
+// --- the generic baseline -------------------------------------------------
+
+/// What a check recorded for this key, if it has seen it before.
+pub fn baseline_value(conn: &Connection, kind: &str, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM baseline WHERE kind = ?1 AND key = ?2", params![kind, key], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// Whether a check has recorded anything yet, which tells a first run apart.
+pub fn baseline_started(conn: &Connection, kind: &str) -> bool {
+    conn.query_row("SELECT 1 FROM baseline WHERE kind = ?1 LIMIT 1", params![kind], |_| Ok(()))
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+pub fn set_baseline_value(conn: &Connection, kind: &str, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO baseline (kind, key, value, first_seen) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(kind, key) DO UPDATE SET value = excluded.value",
+        params![kind, key, value, now()],
+    )
+    .map_err(wrap)?;
+    Ok(())
+}
+
+/// Marks a check as started even when it found nothing to record.
+pub fn mark_baseline_started(conn: &Connection, kind: &str) -> Result<(), String> {
+    set_baseline_value(conn, kind, "", "")
+}
+
 // --- autostart baseline ---------------------------------------------------
 
 pub fn autostart_is_known(conn: &Connection, key: &str) -> bool {
@@ -582,6 +626,16 @@ pub fn autostart_is_known(conn: &Connection, key: &str) -> bool {
         .is_some()
 }
 
+/// Whether a 0.2 baseline already holds entries from this source.
+pub fn autostart_source_recorded(conn: &Connection, source: &str) -> bool {
+    conn.query_row("SELECT 1 FROM autostart_baseline WHERE source = ?1 LIMIT 1", params![source], |_| Ok(()))
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+#[cfg(test)]
 pub fn autostart_baseline_is_empty(conn: &Connection) -> bool {
     conn.query_row("SELECT COUNT(*) FROM autostart_baseline", [], |r| r.get::<_, i64>(0)).unwrap_or(0) == 0
 }
@@ -751,6 +805,21 @@ mod tests {
         // Opening twice must not try to add the columns again.
         drop(conn);
         open_at(&path).unwrap();
+    }
+
+    #[test]
+    fn the_generic_baseline_keeps_checks_apart() {
+        let conn = open_memory();
+        assert!(!baseline_started(&conn, "module"));
+        set_baseline_value(&conn, "module", "nvidia", "PO").unwrap();
+        assert!(baseline_started(&conn, "module"));
+        assert!(!baseline_started(&conn, "extension"));
+        assert_eq!(baseline_value(&conn, "module", "nvidia").as_deref(), Some("PO"));
+        set_baseline_value(&conn, "module", "nvidia", "O").unwrap();
+        assert_eq!(baseline_value(&conn, "module", "nvidia").as_deref(), Some("O"));
+
+        mark_baseline_started(&conn, "extension").unwrap();
+        assert!(baseline_started(&conn, "extension"));
     }
 
     #[test]

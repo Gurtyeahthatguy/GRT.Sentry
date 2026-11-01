@@ -29,7 +29,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use super::{AutostartEntry, LogAccess, RawSocket, ScheduleStatus, TargetSocket};
+use super::{
+    Account, AutostartEntry, BrowserKind, HiddenProcess, KernelModules, LogAccess, PathEntry, ProcessInfo, RawSocket,
+    ScheduleStatus, SpecialFile, TargetSocket,
+};
 
 pub const SYSTEM_NAME: &str = "Windows";
 
@@ -604,7 +607,122 @@ pub fn package_check_note() -> &'static str {
     "Windows keeps no record of what its installers put on the disk, so there is nothing to compare system programs against. Checking their signatures instead is not done yet."
 }
 
+// --- what runs, and what hides --------------------------------------------
+
+/// The full path of a process's executable, when this user may open it.
+fn image_path(pid: u32) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size) };
+    unsafe { CloseHandle(handle) };
+    (ok != 0).then(|| String::from_utf16_lossy(&buffer[..size as usize]))
+}
+
+/// Every process, with its executable's path when it can be opened. A path
+/// that no longer exists is marked the way Linux marks it.
+pub fn processes() -> Vec<ProcessInfo> {
+    process_names()
+        .into_iter()
+        .map(|(pid, name)| {
+            let exe = image_path(pid as u32).map(|path| {
+                if Path::new(&path).exists() {
+                    path
+                } else {
+                    format!("{path} (deleted)")
+                }
+            });
+            ProcessInfo { pid, name, exe }
+        })
+        .collect()
+}
+
+/// Windows offers no second listing to compare the first against.
+pub fn hidden_processes() -> Option<Vec<HiddenProcess>> {
+    None
+}
+
+pub fn hidden_ports() -> Option<Vec<u16>> {
+    None
+}
+
+pub fn kernel_modules() -> Option<KernelModules> {
+    None
+}
+
+/// Windows has no OpenSSH configuration this program reads, so the question
+/// never comes up.
+pub fn listens_beyond_loopback(_port: u16) -> bool {
+    false
+}
+
+/// Windows has no set-user-ID bit and no file capabilities.
+pub fn special_files(_root: &Path, _max_depth: usize, _skip: &[String]) -> Vec<SpecialFile> {
+    Vec::new()
+}
+
+pub fn packaged(_paths: &[String]) -> Option<std::collections::HashSet<String>> {
+    None
+}
+
+pub fn package_conffiles() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::new()
+}
+
+pub fn browser_roots() -> Vec<(String, BrowserKind, PathBuf)> {
+    let local = data_dir();
+    let roaming = config_dir();
+    [
+        ("Firefox", BrowserKind::Firefox, roaming.join("Mozilla\\Firefox\\Profiles")),
+        ("LibreWolf", BrowserKind::Firefox, roaming.join("librewolf\\Profiles")),
+        ("Chrome", BrowserKind::Chromium, local.join("Google\\Chrome\\User Data")),
+        ("Edge", BrowserKind::Chromium, local.join("Microsoft\\Edge\\User Data")),
+        ("Brave", BrowserKind::Chromium, local.join("BraveSoftware\\Brave-Browser\\User Data")),
+        ("Vivaldi", BrowserKind::Chromium, local.join("Vivaldi\\User Data")),
+    ]
+    .into_iter()
+    .filter(|(_, _, dir)| dir.is_dir())
+    .map(|(name, kind, dir)| (name.to_string(), kind, dir))
+    .collect()
+}
+
+/// New accounts on Windows come from the security log, not from a file.
+pub fn accounts() -> Option<Vec<Account>> {
+    None
+}
+
+pub fn sshd_config() -> Option<String> {
+    None
+}
+
+pub fn sudoers() -> LogAccess {
+    LogAccess::Missing
+}
+
+pub fn sudoers_privileged() -> Result<String, String> {
+    Err("Windows has no sudo configuration.".to_string())
+}
+
+/// Windows decides who may write a folder through ACLs, which this does not
+/// read yet.
+pub fn path_entries() -> Vec<PathEntry> {
+    Vec::new()
+}
+
+pub fn journal_auth() -> LogAccess {
+    LogAccess::Missing
+}
+
 // --- what starts by itself ------------------------------------------------
+
+/// Every source the list below reads.
+pub const AUTOSTART_SOURCES: &[&str] = &["user registry", "system registry", "startup folder", "scheduled task"];
 
 pub fn autostart_entries() -> Vec<AutostartEntry> {
     let mut entries = Vec::new();

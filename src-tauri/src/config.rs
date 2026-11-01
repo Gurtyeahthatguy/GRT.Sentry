@@ -34,6 +34,10 @@ pub struct Config {
     /// Compare system programs with what their packages installed.
     pub check_packages: bool,
 
+    /// Look for rootkits, privileged files, changed system folders and weak
+    /// settings.
+    pub check_system: bool,
+
     /// Quarantine automatically above this many detections. Off by default.
     pub auto_quarantine: bool,
     pub auto_quarantine_threshold: u32,
@@ -77,6 +81,7 @@ impl Default for Config {
             deep_scan: false,
             skip_folders: default_skip_folders(),
             check_packages: true,
+            check_system: true,
             auto_quarantine: false,
             auto_quarantine_threshold: 10,
             vt_interval_seconds: 15,
@@ -169,6 +174,7 @@ pub struct ConfigView {
     pub deep_scan: bool,
     pub skip_folders: Vec<String>,
     pub check_packages: bool,
+    pub check_system: bool,
     pub auto_quarantine: bool,
     pub auto_quarantine_threshold: u32,
     pub vt_interval_seconds: u64,
@@ -196,6 +202,7 @@ impl From<&Config> for ConfigView {
             deep_scan: c.deep_scan,
             skip_folders: c.skip_folders.clone(),
             check_packages: c.check_packages,
+            check_system: c.check_system,
             auto_quarantine: c.auto_quarantine,
             auto_quarantine_threshold: c.auto_quarantine_threshold,
             vt_interval_seconds: c.vt_interval_seconds,
@@ -224,6 +231,7 @@ pub struct ConfigUpdate {
     pub deep_scan: Option<bool>,
     pub skip_folders: Option<Vec<String>>,
     pub check_packages: Option<bool>,
+    pub check_system: Option<bool>,
     pub auto_quarantine: Option<bool>,
     pub auto_quarantine_threshold: Option<u32>,
     pub vt_interval_seconds: Option<u64>,
@@ -263,6 +271,9 @@ impl ConfigUpdate {
         }
         if let Some(v) = self.check_packages {
             config.check_packages = v;
+        }
+        if let Some(v) = self.check_system {
+            config.check_system = v;
         }
         if let Some(v) = self.auto_quarantine {
             config.auto_quarantine = v;

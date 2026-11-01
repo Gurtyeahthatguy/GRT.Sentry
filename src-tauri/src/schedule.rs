@@ -48,6 +48,7 @@ mod tests {
     #[test]
     fn status_answers_without_anything_installed() {
         // With nothing installed, the answer is "not installed", not an error.
+        let _env = crate::testenv::lock();
         let status = status();
         if !status.installed {
             assert!(!status.enabled);

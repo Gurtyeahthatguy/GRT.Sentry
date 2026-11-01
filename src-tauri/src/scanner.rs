@@ -566,7 +566,20 @@ pub async fn run_scan(
             false
         }
     };
-    let limits = content::Limits::for_config(config);
+    let mut limits = content::Limits::for_config(config);
+
+    // The user's own rules and indicators, read fresh for this scan and gone
+    // when it ends.
+    let own = crate::indicators::load_rules();
+    outcome.notes.extend(own.errors.iter().cloned());
+    let indicators = std::sync::Arc::new(crate::indicators::Indicators::load());
+    limits.own_rules = own.rules.clone();
+    limits.indicators = indicators.clone();
+    let version = if own.version.is_empty() {
+        crate::rules::version().to_string()
+    } else {
+        format!("{}+{}", crate::rules::version(), own.version)
+    };
 
     let mut budget = config.vt_budget_per_scan;
 
@@ -599,7 +612,7 @@ pub async fn run_scan(
                 // Results from older rules are thrown away.
                 let stored = entry
                     .content
-                    .filter(|_| entry.content_version.as_deref() == Some(crate::rules::version()))
+                    .filter(|_| entry.content_version.as_deref() == Some(version.as_str()))
                     .and_then(|json| serde_json::from_str::<ContentReport>(&json).ok());
                 (entry.sha256, entry.vt_verdict.filter(|_| fresh), stored)
             }
@@ -644,12 +657,18 @@ pub async fn run_scan(
                     .unwrap_or_default();
                 if let Ok(json) = serde_json::to_string(&report) {
                     let conn = db.lock().unwrap();
-                    let _ = db::put_content(&conn, &candidate.path, crate::rules::version(), &json);
+                    let _ = db::put_content(&conn, &candidate.path, &version, &json);
                 }
                 report
             }
             None => ContentReport::default(),
         };
+
+        // Indicators change between scans, so they are never cached.
+        let mut content = content;
+        if let Some(note) = indicators.match_file(&candidate.path, &hash) {
+            content.hits.push(crate::rules::indicator_hit(&note));
+        }
 
         // 4. The verdict, reused or asked for or postponed.
         let verdict = match known_verdict.take() {

@@ -7,8 +7,10 @@
 # Every file under /usr, /etc and /opt, or the directories given, goes through
 # the rules and the archive reader. A match above information is an alarm,
 # and the budget for alarms on a clean machine is written in the test
-# (content.rs, false_positive_budget). It also prints the time and the peak
-# memory, which are the other two budgets the scan has.
+# (content.rs, false_positive_budget). Outside CI, every system check then
+# runs twice on this machine, and the second scan may raise no alarm
+# (dashboard.rs, system_false_positive_budget). It also prints the time and
+# the peak memory, which are the other two budgets the scan has.
 #
 # Exit 0 is within budget, 1 is over it.
 set -euo pipefail
@@ -28,7 +30,14 @@ if [[ -z "$BINARY" ]]; then
   exit 2
 fi
 
-if [[ -x /usr/bin/time ]]; then
-  exec /usr/bin/time -f "peak memory: %M KB" "$BINARY" content::tests::false_positive_budget --ignored --nocapture
+TIME=()
+[[ -x /usr/bin/time ]] && TIME=(/usr/bin/time -f "peak memory: %M KB")
+
+"${TIME[@]}" "$BINARY" content::tests::false_positive_budget --ignored --nocapture || exit 1
+
+# The system checks take the machine as it is, so they run here and not in CI,
+# where the runner is anything but a clean desktop.
+if [[ -z "${CI:-}" ]]; then
+  "${TIME[@]}" "$BINARY" --test-threads=1 --ignored --nocapture \
+    dashboard::tests::system_false_positive_budget folders::tests::on_this_machine || exit 1
 fi
-exec "$BINARY" content::tests::false_positive_budget --ignored --nocapture

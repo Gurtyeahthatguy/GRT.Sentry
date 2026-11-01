@@ -117,6 +117,53 @@ pub fn scan_file(path: &Path) -> Result<Vec<RuleHit>, String> {
     })?
 }
 
+/// A match against the user's indicators file, in the shape of a rule hit.
+pub fn indicator_hit(note: &str) -> RuleHit {
+    RuleHit {
+        rule: "indicator".to_string(),
+        severity: Severity::Critical,
+        title: "Matches one of your indicators".to_string(),
+        detail: format!("Your indicators file lists it: {note}"),
+        member: None,
+        member_sha256: None,
+    }
+}
+
+/// Runs the user's own rules, which carry no promise of metadata, so a rule
+/// without a title is named after itself.
+pub fn scan_with(rules: &yara_x::Rules, data: &[u8]) -> Result<Vec<RuleHit>, String> {
+    let mut scanner = yara_x::Scanner::new(rules);
+    scanner.set_timeout(SCAN_TIMEOUT);
+    let results = scanner.scan(data).map_err(describe)?;
+    Ok(own_hits(results))
+}
+
+pub fn scan_file_with(rules: &yara_x::Rules, path: &Path) -> Result<Vec<RuleHit>, String> {
+    let mut scanner = yara_x::Scanner::new(rules);
+    scanner.set_timeout(SCAN_TIMEOUT);
+    let results = scanner.scan_file(path).map_err(describe)?;
+    Ok(own_hits(results))
+}
+
+fn own_hits(results: yara_x::ScanResults) -> Vec<RuleHit> {
+    let has_title: Vec<bool> =
+        results.matching_rules().map(|r| r.metadata().any(|(k, _)| k == "title")).collect();
+    hits_from(results)
+        .into_iter()
+        .zip(has_title)
+        .map(|(mut hit, titled)| {
+            if !titled {
+                hit.title = format!("Matches your rule {}", hit.rule);
+            }
+            if hit.detail.is_empty() {
+                hit.detail = "One of the rules in your own rules folder matched it.".to_string();
+            }
+            hit.rule = format!("own:{}", hit.rule);
+            hit
+        })
+        .collect()
+}
+
 fn describe(error: yara_x::ScanError) -> String {
     match error {
         yara_x::ScanError::Timeout => "The rules took too long on this file and were stopped".to_string(),

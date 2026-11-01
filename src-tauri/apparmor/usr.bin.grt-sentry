@@ -56,6 +56,10 @@ profile grt-sentry /usr/bin/grt-sentry {
   /etc/** r,
   /usr/** r,
   /var/log/{auth.log,auth.log.*,wtmp,btmp} r,
+  # Temporary folders hold other users' files too, and those are scanned.
+  /tmp/** r,
+  /var/tmp/** r,
+  /dev/shm/** r,
   /var/lib/dpkg/{status,status-old} r,
 
   # Writing: its own database, configuration and quarantine.
@@ -82,13 +86,25 @@ profile grt-sentry /usr/bin/grt-sentry {
   # Matching sockets to processes needs ptrace read; attaching stays refused.
   ptrace (read),
 
+  # Run as root it may read anything and write nothing new: reading past
+  # permissions is granted, writing past them is refused.
+  capability dac_read_search,
+  capability sys_ptrace,
+  deny capability dac_override,
+  /root/** r,
+
   # Read-only helpers: apt for updates, crontab and systemctl for startup
-  # entries, nft to see that it is there, dpkg because apt calls it.
+  # entries, nft to see that it is there, dpkg because apt calls it, and
+  # journalctl for logins.
   /usr/bin/apt ix,
   /usr/bin/crontab ix,
   /usr/bin/systemctl ix,
   /usr/sbin/nft ix,
   /usr/bin/dpkg ix,
+  # journalctl reads the authentication messages where auth.log is gone.
+  /usr/bin/journalctl ix,
+  /var/log/journal/{,**} r,
+  /run/log/journal/{,**} r,
   # Also the hashes in info/ and the diversions, for the package check.
   /var/lib/dpkg/{,**} r,
   /var/lib/apt/lists/{,**} r,
@@ -124,6 +140,8 @@ profile grt-sentry /usr/bin/grt-sentry {
   @{PROC}/sys/kernel/random/boot_id r,
 
   /sys/devices/system/cpu/{,**} r,
+  # The second list of loaded modules, to compare with /proc/modules.
+  /sys/module/{,**} r,
   /sys/fs/cgroup/** r,
   /dev/dri/* rw,
 

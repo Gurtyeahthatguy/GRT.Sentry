@@ -12,7 +12,14 @@ use std::sync::atomic::Ordering;
 use crate::state::{
     Action, AppState, Finding, Issue, IssueKind, IssueTarget, Severity, Snapshot, SystemStatus,
 };
-use crate::{authlog, autostart, db, integrity, netmon, packages, scanner, updates};
+use crate::{
+    accounts, audit, authlog, autostart, db, extensions, folders, indicators, integrity, netmon, packages, platform,
+    privilege, processes, rootkit, scanner, updates,
+};
+
+fn phase(name: &str, message: &str) -> scanner::ScanProgress {
+    scanner::ScanProgress { phase: name.into(), current: 0, total: 0, message: message.into() }
+}
 
 /// Clears the "a scan is running" flag even if something panics.
 struct ScanGuard<'a>(&'a AppState);
@@ -44,6 +51,7 @@ pub async fn scan(
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let own_indicators = indicators::Indicators::load();
 
     // 1. Files, the slow module and the only one that uses the network.
     let outcome = scanner::run_scan(
@@ -76,6 +84,7 @@ pub async fn scan(
         Ok(list) => {
             let count = list.len() as u32;
             findings.extend(netmon::findings(&list));
+            findings.extend(netmon::indicator_findings(&list, &own_indicators));
             count
         }
         Err(e) => {
@@ -128,9 +137,43 @@ pub async fn scan(
             message: "Checking system files".into(),
         });
         findings.extend(integrity::findings(&conn, &config.integrity_paths));
+
+        if let Some(list) = platform::accounts() {
+            findings.extend(accounts::account_findings(&conn, &list));
+        }
+
+        progress(phase("processes", "Checking where running programs come from"));
+        findings.extend(processes::findings(&own_indicators));
+
+        progress(phase("extensions", "Checking browser extensions"));
+        findings.extend(extensions::findings(&conn));
     }
 
-    // 7. Packaged programs. Slow the first time, so the database is locked
+    // The deeper system checks, each a walk or a probe of its own.
+    if config.check_system {
+        progress(phase("rootkits", "Looking for hidden processes, ports and modules"));
+        {
+            let conn = state.db.lock().unwrap();
+            findings.extend(rootkit::findings(&conn));
+        }
+
+        progress(phase("privileges", "Looking for files that hand out privilege"));
+        {
+            let conn = state.db.lock().unwrap();
+            findings.extend(privilege::findings(&conn, &config.skip_folders));
+        }
+
+        progress(phase("folders", "Comparing system folders with what was there"));
+        {
+            let conn = state.db.lock().unwrap();
+            findings.extend(folders::findings(&conn));
+        }
+
+        progress(phase("settings", "Checking SSH, sudo and the search path"));
+        findings.extend(audit::findings());
+    }
+
+    // Packaged programs. Slow the first time, so the database is locked
     // per file rather than for the whole pass.
     if config.check_packages {
         progress(scanner::ScanProgress {
@@ -221,6 +264,7 @@ mod tests {
                 integrity_paths: vec![],
                 // Hashing every system program belongs to its own tests.
                 check_packages: false,
+                check_system: false,
                 ..Default::default()
             }),
             snapshot: Mutex::new(Snapshot::default()),
@@ -328,6 +372,41 @@ mod tests {
 
         assert!(target_of(&state, &id).is_none(), "the target goes with the issue");
         assert!(current(&state).clean, "the last problem leaving makes the machine clean again");
+    }
+
+    /// Run by scripts/check-false-positives.sh, not by `cargo test`.
+    ///
+    /// Every system check on this machine, twice: the first scan records,
+    /// and the second must find nothing to alarm about. Connections, pending
+    /// updates and failed logins describe the machine's real life and are
+    /// left out of the count.
+    #[tokio::test]
+    #[ignore]
+    async fn system_false_positive_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(dir.path());
+        {
+            let mut config = state.config.lock().unwrap();
+            config.check_packages = true;
+            config.check_system = true;
+            config.auth_log_path = crate::platform::default_auth_log();
+        }
+        scan(&state, None, &|_| {}).await.unwrap();
+        let started = std::time::Instant::now();
+        let status = scan(&state, None, &|_| {}).await.unwrap();
+
+        let excluded = [IssueKind::SuspiciousConnection, IssueKind::OutdatedSecurityPackage, IssueKind::FailedLoginAttempts];
+        let alarms: Vec<String> = status
+            .issues
+            .iter()
+            .filter(|i| i.severity != Severity::Info && !excluded.contains(&i.kind))
+            .map(|i| format!("{:?} {}", i.kind, i.title))
+            .collect();
+        println!("second scan: {:.1} s, {} issues, {} alarms", started.elapsed().as_secs_f64(), status.issues.len(), alarms.len());
+        for alarm in &alarms {
+            println!("  {alarm}");
+        }
+        assert!(alarms.is_empty(), "{} alarms on a clean machine", alarms.len());
     }
 
     #[tokio::test]

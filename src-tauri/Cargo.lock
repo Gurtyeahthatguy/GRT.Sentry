@@ -1684,10 +1684,11 @@ dependencies = [
 
 [[package]]
 name = "grt-sentry"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "flate2",
+ "libc",
  "maxminddb",
  "md-5",
  "notify",
@@ -1698,6 +1699,7 @@ dependencies = [
  "serde_json",
  "sevenz-rust2",
  "sha2",
+ "socket2",
  "tar",
  "tauri",
  "tauri-build",

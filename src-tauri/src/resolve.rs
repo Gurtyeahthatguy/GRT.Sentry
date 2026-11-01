@@ -193,6 +193,13 @@ pub fn revert(conn: &Connection, action_id: i64) -> Result<String, String> {
     Ok(message)
 }
 
+/// Makes what a check found the new normal, so it stops being reported.
+pub fn accept_baseline(conn: &Connection, kind: &str, key: &str, value: &str) -> Result<(), String> {
+    db::set_baseline_value(conn, kind, key, value)?;
+    actionlog::record(conn, actionlog::kind::ACCEPT, &format!("{kind} {key}"), Some("confirmed by the user"), false);
+    Ok(())
+}
+
 /// Marks an address as expected, so it stops being reported.
 pub fn trust_ip(conn: &Connection, raw: &str, label: Option<&str>) -> Result<(), String> {
     let ip: IpAddr = raw.trim().parse().map_err(|_| format!("{raw} is not an IP address."))?;

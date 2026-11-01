@@ -10,7 +10,10 @@ use std::process::Command;
 
 use procfs::process::{all_processes, FDTarget};
 
-use super::{AutostartEntry, LogAccess, RawSocket, ScheduleStatus, TargetSocket};
+use super::{
+    Account, AutostartEntry, BrowserKind, HiddenProcess, KernelModules, LogAccess, PathEntry, ProcessInfo, RawSocket,
+    ScheduleStatus, SpecialFile, TargetSocket,
+};
 
 pub const SYSTEM_NAME: &str = "Linux";
 
@@ -552,6 +555,479 @@ pub fn package_check_note() -> &'static str {
     "Neither dpkg nor rpm keeps records on this system, so there is nothing to compare its programs against."
 }
 
+// --- what runs, and what hides --------------------------------------------
+
+fn listed_pids() -> Option<Vec<i32>> {
+    let entries = fs::read_dir("/proc").ok()?;
+    Some(entries.flatten().filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok()).collect())
+}
+
+/// Every process in the list, with the link to its executable when this user
+/// may read it.
+pub fn processes() -> Vec<ProcessInfo> {
+    listed_pids()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|pid| {
+            let name = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim().to_string();
+            let exe = fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned());
+            Some(ProcessInfo { pid, name, exe })
+        })
+        .collect()
+}
+
+/// Processes that answer at /proc/PID but are missing from the listing of
+/// /proc, which is what a rootkit that filters directory reads leaves behind.
+///
+/// Threads answer at /proc/TID too and are never listed, so they are excluded
+/// by their thread group.
+pub fn hidden_processes() -> Option<Vec<HiddenProcess>> {
+    let listed = listed_pids()?;
+    let mut known: std::collections::HashSet<i32> = listed.iter().copied().collect();
+    for pid in &listed {
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
+            known.extend(tasks.flatten().filter_map(|t| t.file_name().to_str()?.parse::<i32>().ok()));
+        }
+    }
+
+    let pid_max = fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(32_768);
+    let highest = listed.iter().copied().max().unwrap_or(0);
+    let limit = highest.saturating_add(10_000).max(32_768).min(pid_max);
+
+    let candidates: Vec<i32> =
+        (1..=limit).filter(|pid| !known.contains(pid) && Path::new(&format!("/proc/{pid}")).exists()).collect();
+
+    // A process that started during the pass is in the listing by now.
+    let relisted: std::collections::HashSet<i32> = listed_pids()?.into_iter().collect();
+    Some(
+        candidates
+            .into_iter()
+            .filter(|pid| !relisted.contains(pid))
+            .filter_map(|pid| {
+                let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(|v| v.trim().to_string());
+                let tgid: i32 = field("Tgid:")?.parse().ok()?;
+                if tgid != pid {
+                    return None;
+                }
+                Some(HiddenProcess { pid, name: field("Name:").unwrap_or_default() })
+            })
+            .collect(),
+    )
+}
+
+fn tcp_local_ports() -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    if let Ok(entries) = procfs::net::tcp() {
+        ports.extend(entries.iter().map(|e| e.local_address.port()));
+    }
+    if let Ok(entries) = procfs::net::tcp6() {
+        ports.extend(entries.iter().map(|e| e.local_address.port()));
+    }
+    ports
+}
+
+/// Whether binding this address fails because something holds the port.
+///
+/// The socket is bound and closed, never listening, so nothing outside can
+/// reach it in between.
+fn port_taken(address: SocketAddr) -> bool {
+    use socket2::{Domain, Socket, Type};
+    let domain = if address.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let Ok(socket) = Socket::new(domain, Type::STREAM, None) else { return false };
+    let _ = socket.set_reuse_address(true);
+    if address.is_ipv6() {
+        let _ = socket.set_only_v6(true);
+    }
+    matches!(socket.bind(&address.into()), Err(e) if e.kind() == io::ErrorKind::AddrInUse)
+}
+
+fn port_in_use(port: u16) -> bool {
+    port_taken(SocketAddr::from(([0, 0, 0, 0], port))) || port_taken(SocketAddr::from(([0u16; 8], port)))
+}
+
+/// TCP ports that something holds but the socket table does not show.
+///
+/// Ports below the unprivileged limit cannot be bound by an ordinary user, so
+/// they are probed only with administrator rights.
+pub fn hidden_ports() -> Option<Vec<u16>> {
+    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok()?;
+    let first = if is_elevated() {
+        1
+    } else {
+        fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(1024)
+            .max(1)
+    };
+
+    let known = tcp_local_ports();
+    let unexplained: Vec<u16> = (first..=u16::MAX).filter(|p| !known.contains(p) && port_in_use(*p)).collect();
+
+    // A connection that opened during the pass explains its port by now.
+    let known = tcp_local_ports();
+    Some(unexplained.into_iter().filter(|p| !known.contains(p) && port_in_use(*p)).collect())
+}
+
+/// The ports below which an ordinary user cannot look.
+#[cfg(test)]
+pub fn hidden_port_floor() -> u16 {
+    if is_elevated() {
+        return 1;
+    }
+    fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(1024)
+}
+
+/// Whether something listens on this TCP port on an address other machines
+/// can reach.
+pub fn listens_beyond_loopback(port: u16) -> bool {
+    let listening = |local: SocketAddr, state: &procfs::net::TcpState| {
+        *state == procfs::net::TcpState::Listen && local.port() == port && !local.ip().is_loopback()
+    };
+    procfs::net::tcp().map(|e| e.iter().any(|e| listening(e.local_address, &e.state))).unwrap_or(false)
+        || procfs::net::tcp6().map(|e| e.iter().any(|e| listening(e.local_address, &e.state))).unwrap_or(false)
+}
+
+pub fn kernel_modules() -> Option<KernelModules> {
+    let listed = fs::read_to_string("/proc/modules")
+        .ok()?
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(String::from))
+        .collect();
+
+    let mut sysfs = Vec::new();
+    for entry in fs::read_dir("/sys/module").ok()?.flatten() {
+        let dir = entry.path();
+        // Built-in modules have a directory here but no initstate.
+        if !dir.join("initstate").exists() {
+            continue;
+        }
+        let taint = fs::read_to_string(dir.join("taint")).unwrap_or_default().trim().to_string();
+        sysfs.push((entry.file_name().to_string_lossy().into_owned(), taint));
+    }
+    Some(KernelModules { listed, sysfs })
+}
+
+/// Permitted capabilities from a file's security.capability attribute.
+fn file_capabilities(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = c"security.capability";
+    let mut buffer = [0u8; 24];
+    // SAFETY: both strings are NUL-terminated and the buffer length is passed.
+    let read = unsafe {
+        libc::getxattr(c_path.as_ptr(), name.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len())
+    };
+    if read < 8 {
+        return None;
+    }
+    let word = |at: usize| u32::from_le_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]]) as u64;
+    let low = word(4);
+    // Version 2 and 3 carry the upper 32 capabilities after the lower ones.
+    let high = if read >= 20 { word(12) } else { 0 };
+    let permitted = low | (high << 32);
+    (permitted != 0).then_some(permitted)
+}
+
+/// Files under a root with set-user-ID, set-group-ID or capabilities, without
+/// leaving its filesystem.
+pub fn special_files(root: &Path, max_depth: usize, skip: &[String]) -> Vec<SpecialFile> {
+    let keep = |e: &walkdir::DirEntry| {
+        !(e.depth() > 0
+            && e.file_type().is_dir()
+            && e.file_name().to_str().is_some_and(|name| skip.iter().any(|s| s == name)))
+    };
+
+    walkdir::WalkDir::new(root)
+        .max_depth(max_depth)
+        .follow_links(false)
+        .same_file_system(true)
+        .into_iter()
+        .filter_entry(keep)
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| {
+            let metadata = e.metadata().ok()?;
+            let mode = metadata.mode();
+            let capabilities = if mode & 0o111 != 0 { file_capabilities(e.path()) } else { None };
+            if mode & 0o6000 == 0 && capabilities.is_none() {
+                return None;
+            }
+            Some(SpecialFile {
+                path: e.path().to_string_lossy().into_owned(),
+                mode,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                capabilities,
+            })
+        })
+        .collect()
+}
+
+// --- packages, beyond their hashes -----------------------------------------
+
+/// Which of these paths some installed package owns.
+pub fn packaged(paths: &[String]) -> Option<std::collections::HashSet<String>> {
+    use crate::packages::path_key;
+
+    let info = Path::new("/var/lib/dpkg/info");
+    if info.is_dir() {
+        let wanted: HashMap<String, &String> = paths.iter().map(|p| (path_key(p).to_string(), p)).collect();
+        let mut owned = std::collections::HashSet::new();
+        // dpkg-divert moves a packaged file aside under a new name, which no
+        // package list mentions.
+        if let Ok(text) = fs::read_to_string("/var/lib/dpkg/diversions") {
+            for (_, (moved_to, _)) in crate::packages::parse_diversions(&text) {
+                if let Some(path) = wanted.get(path_key(&moved_to)) {
+                    owned.insert((*path).clone());
+                }
+            }
+        }
+        for entry in fs::read_dir(info).ok()?.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("list") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(entry.path()) else { continue };
+            for line in text.lines() {
+                if let Some(path) = wanted.get(path_key(line)) {
+                    owned.insert((*path).clone());
+                }
+            }
+        }
+        return Some(owned);
+    }
+
+    which("rpm")?;
+    if paths.is_empty() {
+        return Some(Default::default());
+    }
+    let mut owned = std::collections::HashSet::new();
+    for chunk in paths.chunks(500) {
+        let mut args = vec!["-qf", "--qf", "%{NAME}\\n"];
+        args.extend(chunk.iter().map(|s| s.as_str()));
+        // rpm exits non-zero when any one path is unowned, so stdout is read
+        // either way: one line per path, in order.
+        let Ok(output) = Command::new("rpm").args(&args).env("LC_ALL", "C").output() else { return None };
+        let text = String::from_utf8_lossy(&output.stdout);
+        for (path, line) in chunk.iter().zip(text.lines()) {
+            if !line.contains("is not owned by any package") {
+                owned.insert(path.clone());
+            }
+        }
+    }
+    Some(owned)
+}
+
+/// Configuration files as their packages shipped them, path to digest.
+pub fn package_conffiles() -> HashMap<String, String> {
+    if let Ok(text) = fs::read_to_string("/var/lib/dpkg/status") {
+        return crate::packages::parse_conffiles(&text);
+    }
+    if which("rpm").is_some() {
+        if let Ok(text) = run_plain("rpm", &["-qa", "--qf", crate::packages::RPM_QUERY_FORMAT]) {
+            return crate::packages::parse_rpm_conffiles(&text);
+        }
+    }
+    HashMap::new()
+}
+
+// --- browsers -------------------------------------------------------------
+
+/// Where each browser keeps its profiles, packaged the usual way, as a snap
+/// or as a flatpak.
+pub fn browser_roots() -> Vec<(String, BrowserKind, PathBuf)> {
+    let home = home();
+    let config = config_dir();
+    let firefox = [
+        ("Firefox", home.join(".mozilla/firefox")),
+        ("Firefox", home.join("snap/firefox/common/.mozilla/firefox")),
+        ("Firefox", home.join(".var/app/org.mozilla.firefox/.mozilla/firefox")),
+        ("LibreWolf", home.join(".librewolf")),
+        ("LibreWolf", home.join(".var/app/io.gitlab.librewolf-community/.librewolf")),
+    ];
+    let chromium = [
+        ("Chrome", config.join("google-chrome")),
+        ("Chrome", home.join(".var/app/com.google.Chrome/config/google-chrome")),
+        ("Chromium", config.join("chromium")),
+        ("Chromium", home.join("snap/chromium/common/chromium")),
+        ("Chromium", home.join(".var/app/org.chromium.Chromium/config/chromium")),
+        ("Brave", config.join("BraveSoftware/Brave-Browser")),
+        ("Brave", home.join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser")),
+        ("Edge", config.join("microsoft-edge")),
+        ("Vivaldi", config.join("vivaldi")),
+    ];
+    firefox
+        .into_iter()
+        .map(|(name, dir)| (name.to_string(), BrowserKind::Firefox, dir))
+        .chain(chromium.into_iter().map(|(name, dir)| (name.to_string(), BrowserKind::Chromium, dir)))
+        .filter(|(_, _, dir)| dir.is_dir())
+        .collect()
+}
+
+// --- accounts and configuration -------------------------------------------
+
+pub fn accounts() -> Option<Vec<Account>> {
+    let text = fs::read_to_string("/etc/passwd").ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() < 7 {
+                    return None;
+                }
+                Some(Account { name: fields[0].to_string(), uid: fields[2].parse().ok()?, shell: fields[6].to_string() })
+            })
+            .collect(),
+    )
+}
+
+/// The SSH server's configuration with its includes spliced in, when an SSH
+/// server is installed.
+pub fn sshd_config() -> Option<String> {
+    if !Path::new("/usr/sbin/sshd").exists() {
+        return None;
+    }
+    fn read_with_includes(path: &Path, depth: u32, out: &mut String) {
+        let Ok(text) = fs::read_to_string(path) else { return };
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let mut words = trimmed.split_whitespace();
+            if depth < 4 && words.next().is_some_and(|w| w.eq_ignore_ascii_case("include")) {
+                for pattern in words {
+                    let pattern = if pattern.starts_with('/') { pattern.to_string() } else { format!("/etc/ssh/{pattern}") };
+                    for file in expand_glob(&pattern) {
+                        read_with_includes(&file, depth + 1, out);
+                    }
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    let mut out = String::new();
+    read_with_includes(Path::new("/etc/ssh/sshd_config"), 0, &mut out);
+    Some(out)
+}
+
+/// A `dir/*.suffix` pattern, which is the only shape sshd's includes take in
+/// practice.
+fn expand_glob(pattern: &str) -> Vec<PathBuf> {
+    let Some((dir, file)) = pattern.rsplit_once('/') else { return vec![] };
+    let Some((prefix, suffix)) = file.split_once('*') else { return vec![PathBuf::from(pattern)] };
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// The sudo rules, which only root may normally read.
+pub fn sudoers() -> LogAccess {
+    let main = Path::new("/etc/sudoers");
+    let mut text = match fs::read_to_string(main) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return LogAccess::Denied,
+        Err(_) => return LogAccess::Missing,
+    };
+    match fs::read_dir("/etc/sudoers.d") {
+        Ok(entries) => {
+            let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            files.sort();
+            for file in files {
+                match fs::read_to_string(&file) {
+                    Ok(more) => text.push_str(&more),
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return LogAccess::Denied,
+                    Err(_) => {}
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return LogAccess::Denied,
+        Err(_) => {}
+    }
+    LogAccess::Ok(text)
+}
+
+pub fn sudoers_privileged() -> Result<String, String> {
+    run_privileged("sh", &["-c", "cat /etc/sudoers; cat /etc/sudoers.d/* 2>/dev/null; true"])
+}
+
+/// Every directory programs are looked up in, from this process's PATH and
+/// the system default.
+pub fn path_entries() -> Vec<PathEntry> {
+    let from_env = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<String> = from_env.split(':').map(String::from).collect();
+    for standard in ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+        dirs.push(standard.to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+
+    dirs.into_iter()
+        .filter_map(|dir| {
+            // An empty entry or a relative one means the current directory.
+            if dir.is_empty() || !dir.starts_with('/') {
+                return Some(PathEntry { dir, ..Default::default() });
+            }
+            let metadata = fs::metadata(&dir).ok()?;
+            if !metadata.is_dir() {
+                return None;
+            }
+            let mode = metadata.mode();
+            let writable_files = fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| {
+                            let m = fs::symlink_metadata(e.path()).ok()?;
+                            (m.is_file() && m.mode() & 0o002 != 0).then(|| e.path().to_string_lossy().into_owned())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(PathEntry { dir, world_writable: mode & 0o002 != 0, sticky: mode & 0o1000 != 0, writable_files })
+        })
+        .collect()
+}
+
+/// The last day of authentication messages from the journal, for systems
+/// that no longer write /var/log/auth.log.
+pub fn journal_auth() -> LogAccess {
+    if which("journalctl").is_none() {
+        return LogAccess::Missing;
+    }
+    let Ok(output) = Command::new("journalctl")
+        .args(["SYSLOG_FACILITY=4", "SYSLOG_FACILITY=10", "--since=-24h", "-o", "short-iso", "-q", "--no-pager"])
+        .env("LC_ALL", "C")
+        .output()
+    else {
+        return LogAccess::Missing;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("insufficient permissions") || stderr.contains("not seeing messages from other users") {
+        return LogAccess::Denied;
+    }
+    if !output.status.success() {
+        return LogAccess::Missing;
+    }
+    LogAccess::Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 // --- what starts by itself ------------------------------------------------
 
 pub fn autostart_entries() -> Vec<AutostartEntry> {
@@ -560,7 +1036,158 @@ pub fn autostart_entries() -> Vec<AutostartEntry> {
     entries.extend(desktop_entries(Path::new("/etc/xdg/autostart"), "system desktop entry"));
     entries.extend(user_services());
     entries.extend(user_crontab());
+    entries.extend(system_services());
+    entries.extend(system_cron());
+    entries.extend(shell_startup());
+    entries.extend(boot_modules());
     entries
+}
+
+/// Every source the list above reads, so one that is empty today still
+/// counts as watched.
+pub const AUTOSTART_SOURCES: &[&str] = &[
+    "user desktop entry",
+    "system desktop entry",
+    "user service",
+    "cron",
+    "system service",
+    "system cron",
+    "cron script",
+    "shell startup",
+    "boot module",
+];
+
+/// System units enabled to start, read from the links systemctl enable
+/// leaves rather than from systemctl, which would need the system bus.
+fn system_services() -> Vec<AutostartEntry> {
+    let mut units = Vec::new();
+    for base in ["/etc/systemd/system", "/usr/lib/systemd/system"] {
+        let Ok(entries) = fs::read_dir(base) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !(name.ends_with(".wants") || name.ends_with(".requires")) {
+                continue;
+            }
+            let Ok(links) = fs::read_dir(entry.path()) else { continue };
+            units.extend(links.flatten().map(|l| l.file_name().to_string_lossy().into_owned()));
+        }
+    }
+    units.sort();
+    units.dedup();
+    units
+        .into_iter()
+        .map(|unit| AutostartEntry {
+            key: format!("system service:{unit}"),
+            source: "system service".to_string(),
+            name: unit.clone(),
+            command: format!("systemctl status {unit}"),
+        })
+        .collect()
+}
+
+/// The meaningful lines of a configuration file: no blanks, no comments.
+fn lines_of(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn files_in(dir: &str) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect())
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+fn system_cron() -> Vec<AutostartEntry> {
+    let mut out = Vec::new();
+    let mut tables = vec![PathBuf::from("/etc/crontab")];
+    tables.extend(files_in("/etc/cron.d"));
+    for table in tables {
+        let file = table.to_string_lossy().into_owned();
+        for line in lines_of(&table) {
+            // SHELL=, PATH= and MAILTO= set the environment and schedule nothing.
+            let first = line.split_whitespace().next().unwrap_or("");
+            if first.contains('=') {
+                continue;
+            }
+            out.push(AutostartEntry {
+                key: format!("system cron:{file}|{line}"),
+                source: "system cron".to_string(),
+                name: format!("Scheduled in {file}"),
+                command: line,
+            });
+        }
+    }
+    for period in ["hourly", "daily", "weekly", "monthly"] {
+        for script in files_in(&format!("/etc/cron.{period}")) {
+            let path = script.to_string_lossy().into_owned();
+            if path.ends_with("/.placeholder") {
+                continue;
+            }
+            out.push(AutostartEntry {
+                key: format!("cron script:{path}"),
+                source: "cron script".to_string(),
+                name: format!("Runs {period}"),
+                command: path,
+            });
+        }
+    }
+    out
+}
+
+/// Each line of the files a shell reads when it starts, because one line is
+/// all it takes to run something at every login.
+fn shell_startup() -> Vec<AutostartEntry> {
+    let home = home();
+    let mut files: Vec<PathBuf> = [
+        ".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".zshenv", ".config/fish/config.fish",
+    ]
+    .iter()
+    .map(|f| home.join(f))
+    .collect();
+    files.extend(["/etc/profile", "/etc/bash.bashrc", "/etc/zsh/zshrc", "/etc/zsh/zprofile"].iter().map(PathBuf::from));
+    files.extend(files_in("/etc/profile.d"));
+
+    let mut out = Vec::new();
+    for file in files {
+        let path = file.to_string_lossy().into_owned();
+        for line in lines_of(&file) {
+            out.push(AutostartEntry {
+                key: format!("shell startup:{path}|{line}"),
+                source: "shell startup".to_string(),
+                name: format!("A line in {path}"),
+                command: line,
+            });
+        }
+    }
+    out
+}
+
+fn boot_modules() -> Vec<AutostartEntry> {
+    let mut files = vec![PathBuf::from("/etc/modules")];
+    files.extend(files_in("/etc/modules-load.d"));
+    let mut out = Vec::new();
+    for file in files {
+        let path = file.to_string_lossy().into_owned();
+        for line in lines_of(&file) {
+            let module = line.split_whitespace().next().unwrap_or(&line).to_string();
+            out.push(AutostartEntry {
+                key: format!("boot module:{module}"),
+                source: "boot module".to_string(),
+                name: format!("Kernel module {module}"),
+                command: format!("loaded at boot, from {path}"),
+            });
+        }
+    }
+    out
 }
 
 fn desktop_entries(dir: &Path, source: &str) -> Vec<AutostartEntry> {
@@ -670,6 +1297,8 @@ pub fn entry_path_for(source: &str, file: &str) -> Option<PathBuf> {
     match source {
         "user desktop entry" => Some(config_dir().join("autostart").join(file)),
         "system desktop entry" => Some(PathBuf::from("/etc/xdg/autostart").join(file)),
+        "system cron" | "shell startup" => file.split_once('|').map(|(path, _)| PathBuf::from(path)),
+        "cron script" => Some(PathBuf::from(file)),
         _ => None,
     }
 }
@@ -728,7 +1357,7 @@ pub fn auth_log_denied_detail(path: &str) -> String {
 
 pub fn auth_log_missing_detail(path: &str) -> String {
     format!(
-        "Nothing at {path}. Many systems keep authentication records only in the systemd journal, in which case this module has nothing to read and the rest of the scan is unaffected."
+        "Nothing at {path}, and the systemd journal could not be read either. Reading the journal's authentication messages needs membership of the adm or systemd-journal group."
     )
 }
 

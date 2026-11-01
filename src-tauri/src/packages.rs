@@ -60,14 +60,14 @@ impl Manager {
 
 /// Paths relative to the root, with or without the `usr/` that a merged
 /// `/usr` adds, compared as one.
-fn key(relative: &str) -> &str {
+pub fn path_key(relative: &str) -> &str {
     let relative = relative.trim_start_matches('/');
     relative.strip_prefix("usr/").unwrap_or(relative)
 }
 
 /// The directories a replaced file matters most in.
 pub fn in_scope(relative: &str) -> bool {
-    let relative = key(relative);
+    let relative = path_key(relative);
     if let Some(rest) = relative.strip_prefix("bin/").or_else(|| relative.strip_prefix("sbin/")) {
         return !rest.is_empty() && !rest.contains('/');
     }
@@ -103,7 +103,7 @@ pub fn parse_diversions(text: &str) -> HashMap<String, (String, String)> {
     let lines: Vec<&str> = text.lines().collect();
     lines
         .chunks_exact(3)
-        .map(|triplet| (key(triplet[0]).to_string(), (triplet[1].to_string(), triplet[2].to_string())))
+        .map(|triplet| (path_key(triplet[0]).to_string(), (triplet[1].to_string(), triplet[2].to_string())))
         .collect()
 }
 
@@ -131,13 +131,13 @@ pub fn dpkg_manifest(info_dir: &Path, root: &Path) -> Result<Vec<PackagedFile>, 
             let relative = file.path.strip_prefix(root).unwrap_or(&file.path).to_string_lossy().into_owned();
 
             // A file another package diverted lives under its new name.
-            if let Some((moved_to, by)) = diversions.get(key(&relative)) {
+            if let Some((moved_to, by)) = diversions.get(path_key(&relative)) {
                 if by != package {
                     file.path = root.join(moved_to.trim_start_matches('/'));
                 }
             }
 
-            if seen.insert(key(&file.path.strip_prefix(root).unwrap_or(&file.path).to_string_lossy()).to_string()) {
+            if seen.insert(path_key(&file.path.strip_prefix(root).unwrap_or(&file.path).to_string_lossy()).to_string()) {
                 out.push(file);
             }
         }
@@ -168,7 +168,7 @@ pub fn parse_rpm_query(text: &str) -> Vec<PackagedFile> {
             if flags.contains('c') || !(digest.len() == 32 || digest.len() == 64) || !in_scope(path) {
                 return None;
             }
-            if !seen.insert(key(path).to_string()) {
+            if !seen.insert(path_key(path).to_string()) {
                 return None;
             }
             Some(PackagedFile {
@@ -178,6 +178,56 @@ pub fn parse_rpm_query(text: &str) -> Vec<PackagedFile> {
             })
         })
         .collect()
+}
+
+// --- configuration files --------------------------------------------------
+
+/// What dpkg recorded for each configuration file as its package shipped it,
+/// from `/var/lib/dpkg/status`.
+pub fn parse_conffiles(status: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut inside = false;
+    for line in status.lines() {
+        if line.starts_with("Conffiles:") {
+            inside = true;
+            continue;
+        }
+        if !line.starts_with(' ') {
+            inside = false;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(path), Some(digest)) = (fields.next(), fields.next()) else { continue };
+        // A file the package no longer ships is marked obsolete.
+        if fields.next().is_some() || digest.len() != 32 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        out.insert(path.to_string(), digest.to_ascii_lowercase());
+    }
+    out
+}
+
+/// The configuration files in `rpm -qa --qf RPM_QUERY_FORMAT`, path to digest.
+pub fn parse_rpm_conffiles(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, '\t');
+            let digest = fields.next()?;
+            let flags = fields.next()?;
+            let _package = fields.next()?;
+            let path = fields.next()?;
+            (flags.contains('c') && (digest.len() == 32 || digest.len() == 64))
+                .then(|| (path.to_string(), digest.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+/// The digest of a file in whichever algorithm a record of this length uses.
+pub fn digest_like(path: &Path, record: &str) -> std::io::Result<String> {
+    digest_file(path, record.len() == 32)
 }
 
 // --- comparing ------------------------------------------------------------
@@ -498,6 +548,23 @@ mod tests {
         let paths: Vec<_> = found.iter().map(|f| f.path.to_string_lossy().into_owned()).collect();
         assert_eq!(paths, vec!["/usr/bin/ls", "/usr/lib64/security/pam_unix.so"]);
         assert_eq!(found[0].package.as_deref(), Some("coreutils"));
+    }
+
+    #[test]
+    fn conffiles_are_read_from_the_status_file_and_obsolete_ones_dropped() {
+        let status = "Package: openssh-server\nStatus: install ok installed\nConffiles:\n /etc/pam.d/sshd 8b4c7a1200000000000000000000beef\n /etc/old.conf 0123456789abcdef0123456789abcdef obsolete\nDescription: x\n continued description line\n";
+        let found = parse_conffiles(status);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found.get("/etc/pam.d/sshd").map(String::as_str), Some("8b4c7a1200000000000000000000beef"));
+    }
+
+    #[test]
+    fn rpm_conffiles_are_the_lines_flagged_c() {
+        let sha = "b".repeat(64);
+        let text = format!("{sha}\tc\tsudo\t/etc/sudoers\n{sha}\t\tsudo\t/usr/bin/sudo\n");
+        let found = parse_rpm_conffiles(&text);
+        assert_eq!(found.len(), 1);
+        assert!(found.contains_key("/etc/sudoers"));
     }
 
     #[test]

@@ -49,6 +49,21 @@ pub enum IssueKind {
     UncheckedArchive,
     /// A system program whose contents differ from what its package installed.
     PackageMismatch,
+    /// A process running from a deleted file, from memory or from a temporary folder.
+    SuspiciousProcess,
+    /// Something the kernel answers for that the usual listings leave out.
+    HiddenActivity,
+    /// A kernel module that was not loaded before.
+    KernelModule,
+    BrowserExtension,
+    /// Set-user-ID, set-group-ID or capabilities where they hand out privilege.
+    SpecialPermission,
+    /// A setting that leaves a door open: SSH, sudo, the search path.
+    WeakConfiguration,
+    /// A new account, a new sudo user, a login at an unusual hour.
+    AccountActivity,
+    /// A file in a watched system folder that no package explains.
+    FolderChanged,
     /// A module could not run, for want of a key or a permission.
     ModuleUnavailable,
 }
@@ -111,6 +126,9 @@ pub enum IssueTarget {
     Connection { ip: String, pid: Option<i32>, process: Option<String> },
     Integrity { path: String, current_hash: String },
     Package { path: String, digest: String },
+    Process { pid: i32, name: String },
+    /// Something a check recorded, which "Expected" makes the new normal.
+    Baseline { kind: String, key: String, value: String },
     Autostart { key: String, name: String },
     Packages { names: Vec<String> },
     LoginAttempts { ip: String },

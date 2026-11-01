@@ -131,7 +131,7 @@ function setScanning(value) {
   if (value) {
     nodes.mark.className = "verdict-mark is-working";
     nodes.line.textContent = "Checking…";
-    nodes.detail.textContent = "Files, connections, updates, startup entries, logins and system files.";
+    nodes.detail.textContent = "Files, connections, processes, startup entries, logins, extensions and the system itself.";
   } else {
     nodes.progressFill.style.width = "0";
     nodes.progressText.textContent = "";
@@ -154,6 +154,12 @@ function showProgress(progress) {
     logins: "Logins",
     integrity: "System files",
     packages: "System programs",
+    processes: "Processes",
+    extensions: "Browser extensions",
+    rootkits: "Rootkits",
+    privileges: "Privileged files",
+    folders: "System folders",
+    settings: "Settings that matter",
     done: "Finishing",
   }[progress.phase] || progress.phase;
 
@@ -171,7 +177,7 @@ function render(status) {
     nodes.mark.className = "verdict-mark is-clean";
     nodes.line.textContent = status.last_scan ? "Nothing needs attention" : "Not scanned yet";
     nodes.detail.textContent = status.last_scan
-      ? "Files, connections, updates, startup entries, system files and system programs were all checked."
+      ? "Files, connections, processes, startup entries, logins, extensions and the system itself were all checked."
       : "Press Scan now to check this machine.";
   } else {
     nodes.mark.className = `verdict-mark is-${worst}`;

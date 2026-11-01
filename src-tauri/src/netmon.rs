@@ -280,9 +280,57 @@ pub fn findings(connections: &[Connection]) -> Vec<Finding> {
     findings
 }
 
+/// Connections to an address in the user's indicators, whatever else is
+/// known about them.
+pub fn indicator_findings(connections: &[Connection], indicators: &crate::indicators::Indicators) -> Vec<Finding> {
+    let mut seen: Vec<(String, Option<i32>)> = Vec::new();
+    let mut findings = Vec::new();
+    for c in connections {
+        let Ok(ip) = c.remote_addr.parse::<std::net::IpAddr>() else { continue };
+        let Some(note) = indicators.match_ip(&ip) else { continue };
+        let key = (c.remote_addr.clone(), c.pid);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+
+        let mut actions = vec![
+            Action::new("close_connection", "Close connection", true),
+            Action::new("block_ip", "Block address", true),
+        ];
+        if c.pid.is_some() {
+            actions.push(Action::new("kill_process", "Stop process", true));
+        }
+        actions.push(Action::ignore());
+        findings.push(Finding::new(
+            Issue {
+                kind: IssueKind::SuspiciousConnection,
+                severity: Severity::Critical,
+                title: format!("Connection to an address in your indicators: {}", c.remote_addr),
+                location: c.describe(),
+                detail: Some(format!("Your indicators file lists this address: {note}")),
+                actions,
+                ..Default::default()
+            },
+            IssueTarget::Connection { ip: c.remote_addr.clone(), pid: c.pid, process: c.process_name.clone() },
+        ));
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_to_a_listed_address_is_critical_even_when_trusted() {
+        let mut c = conn("203.0.113.50", 443, Some(9), Some("curl"), false);
+        c.trusted = true;
+        let indicators = crate::indicators::Indicators::parse("203.0.113.0/24 test range\n");
+        let found = indicator_findings(&[c.clone(), c], &indicators);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].issue.severity, Severity::Critical);
+    }
 
     fn conn(ip: &str, port: u16, pid: Option<i32>, name: Option<&str>, is_new: bool) -> Connection {
         Connection {

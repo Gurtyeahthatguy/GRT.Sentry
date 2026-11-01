@@ -15,11 +15,13 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::indicators::Indicators;
 use crate::rules::{self, RuleHit};
 use crate::state::Severity;
 
@@ -48,6 +50,10 @@ pub struct Limits {
     pub total_bytes: u64,
     /// Unpacked size over compressed size.
     pub ratio: u64,
+    /// The user's rules, compiled for this scan.
+    pub own_rules: Option<Arc<yara_x::Rules>>,
+    /// Hashes and names a member is compared against.
+    pub indicators: Arc<Indicators>,
 }
 
 impl Limits {
@@ -58,6 +64,8 @@ impl Limits {
             member_bytes: config.max_file_bytes().min(32 * MB),
             total_bytes: 512 * MB,
             ratio: 200,
+            own_rules: None,
+            indicators: Arc::default(),
         }
     }
 }
@@ -143,6 +151,12 @@ pub fn inspect(path: &Path, limits: &Limits) -> ContentReport {
     match rules::scan_file(path) {
         Ok(hits) => walker.report.hits = hits,
         Err(e) => walker.note(Unchecked::Unreadable { member: String::new(), reason: e }),
+    }
+    if let Some(own) = &limits.own_rules {
+        match rules::scan_file_with(own, path) {
+            Ok(hits) => walker.report.hits.extend(hits),
+            Err(e) => walker.note(Unchecked::Unreadable { member: String::new(), reason: e }),
+        }
     }
 
     let Ok(mut file) = File::open(path) else { return walker.report };
@@ -529,15 +543,24 @@ impl Walker<'_> {
     fn member(&mut self, name: String, data: Vec<u8>, depth: u32) {
         let sha256 = format!("{:x}", Sha256::digest(&data));
 
-        match rules::scan_bytes(&data) {
-            Ok(hits) => {
-                for mut hit in hits {
-                    hit.member = Some(name.clone());
-                    hit.member_sha256 = Some(sha256.clone());
-                    self.report.hits.push(hit);
+        let mut results = vec![rules::scan_bytes(&data)];
+        if let Some(own) = &self.limits.own_rules {
+            results.push(rules::scan_with(own, &data));
+        }
+        if let Some(note) = self.limits.indicators.match_file(&name, &sha256) {
+            results.push(Ok(vec![crate::rules::indicator_hit(&note)]));
+        }
+        for result in results {
+            match result {
+                Ok(hits) => {
+                    for mut hit in hits {
+                        hit.member = Some(name.clone());
+                        hit.member_sha256 = Some(sha256.clone());
+                        self.report.hits.push(hit);
+                    }
                 }
+                Err(e) => self.note(Unchecked::Unreadable { member: name.clone(), reason: e }),
             }
-            Err(e) => self.note(Unchecked::Unreadable { member: name.clone(), reason: e }),
         }
 
         if let Some(kind) = sniff(&data) {
@@ -594,7 +617,15 @@ mod tests {
     }
 
     fn limits() -> Limits {
-        Limits { depth: 3, members: 10_000, member_bytes: 32 * MB, total_bytes: 512 * MB, ratio: 200 }
+        Limits {
+            depth: 3,
+            members: 10_000,
+            member_bytes: 32 * MB,
+            total_bytes: 512 * MB,
+            ratio: 200,
+            own_rules: None,
+            indicators: Arc::default(),
+        }
     }
 
     fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -888,6 +919,28 @@ mod tests {
         #[allow(clippy::absurd_extreme_comparisons)]
         let within = alarms.len() <= BUDGET;
         assert!(within, "{} alarms on a clean machine, over the budget of {BUDGET}", alarms.len());
+    }
+
+    #[test]
+    fn the_users_rules_and_indicators_reach_inside_archives() {
+        let mut compiler = yara_x::Compiler::new();
+        compiler.add_source("rule company_secret { strings: $a = \"PROJECT-NIGHTJAR\" condition: $a }").unwrap();
+        let payload = b"internal: PROJECT-NIGHTJAR plans".to_vec();
+        let dropper = b"just a binary".to_vec();
+        let dropper_hash = format!("{:x}", Sha256::digest(&dropper));
+
+        let with_own = Limits {
+            own_rules: Some(Arc::new(compiler.build())),
+            indicators: Arc::new(Indicators::parse(&format!("{dropper_hash} known dropper\n"))),
+            ..limits()
+        };
+        let report = inspect_bytes("leak.zip", &zip_of(&[("notes.txt", &payload), ("tool.bin", &dropper)]), &with_own);
+        let rules: Vec<&str> = report.hits.iter().map(|h| h.rule.as_str()).collect();
+        assert!(rules.contains(&"own:company_secret"), "{rules:?}");
+        assert!(rules.contains(&"indicator"));
+        let indicator = report.hits.iter().find(|h| h.rule == "indicator").unwrap();
+        assert_eq!(indicator.member.as_deref(), Some("tool.bin"));
+        assert_eq!(indicator.severity, Severity::Critical);
     }
 
     #[test]

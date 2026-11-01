@@ -23,6 +23,7 @@ pub mod kind {
     pub const TRUST_IP: &str = "trust_ip";
     pub const UPDATE_BASELINE: &str = "update_baseline";
     pub const UPLOAD_VT: &str = "upload_vt";
+    pub const ACCEPT: &str = "accept";
 }
 
 /// Writes one line.
@@ -63,6 +64,7 @@ pub fn describe(record: &ActionRecord) -> String {
         kind::TRUST_IP => "Trusted",
         kind::UPDATE_BASELINE => "Updated the reference hash for",
         kind::UPLOAD_VT => "Sent for analysis",
+        kind::ACCEPT => "Accepted as expected:",
         other => other,
     };
     format!("{what} {}", record.target)

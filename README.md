@@ -3,8 +3,10 @@
 A security scanner for the machine it runs on. It opens, checks, shows what it
 found, and offers something to do about each thing.
 
-- **Seven checks, one answer.** Files, network connections, pending updates,
-  startup entries, failed logins, system file integrity, packaged programs.
+- **One answer for the whole machine.** Files, connections, processes,
+  rootkits, startup entries, logins and accounts, browser extensions,
+  privileged files, system folders, packaged programs, the settings that leave
+  a door open, and pending updates.
 - **Offline first.** Files are judged by rules that ship with the program, and
   archives are opened and judged too. VirusTotal adds its engines when given a
   key; nothing depends on it.
@@ -71,18 +73,64 @@ browser is for.
 **Pending updates.** Lists what the system's package tool has a newer version
 for. It installs nothing: it shows the list and the command.
 
-**Startup entries.** Records what starts automatically the first time it runs,
-and afterwards reports only what is new. A list of forty legitimate entries
-says nothing; "this one was not here yesterday" says a lot.
+**Processes.** Every process this user may inspect, and where its program
+lives: deleted from the disk, held only in memory, or in a temporary folder
+anyone can write to. A program still running the version an update replaced
+is told apart and mentioned once, as a reminder.
 
-**Failed logins.** Counts authentication failures per address in the last
-24 hours and offers to block the ones that are clearly knocking.
+**Rootkits.** What a rootkit hides is found by asking the kernel twice. A
+process that answers at `/proc/PID` but is missing from the listing, a TCP port
+that cannot be bound but holds no visible socket, a kernel module in
+`/sys/module` that `/proc/modules` leaves out. Modules built outside the
+kernel, such as graphics drivers, are recorded once and only a new one is
+reported.
+
+**Startup entries.** Desktop entries, user and system services, user and
+system cron, the scripts in `/etc/cron.*`, the modules loaded at boot, and each
+line of the files a shell reads when it starts. Recorded the first time each
+place is read, and afterwards only what is new is reported. A list of forty
+legitimate entries says nothing; "this one was not here yesterday" says a lot.
+A new line in `.bashrc` is information unless the rules see something in it.
+
+**Logins and accounts.** Counts authentication failures per address in the
+last 24 hours, from `/var/log/auth.log` or from the journal, and offers to
+block the ones that are clearly knocking. A second account with user ID 0, a
+new account that can log in, a user who starts using sudo, and an SSH login at
+an hour when the machine has never seen one are each reported.
+
+**Browser extensions.** Firefox and the Chromium family, including the snap
+and flatpak builds. An extension that did not come from the store, loaded
+unpacked, placed by another program or forced in by a policy, is reported until
+it is accepted. One from the store is mentioned when it is new.
+
+**Privileged files.** Set-user-ID, set-group-ID and file capabilities. One on a
+program that can be asked to start a shell, such as `find` or an interpreter,
+is root for everyone; one no package installed, or in a temporary folder or
+the home, is how a machine is kept open. The list of programs that escalate
+was written for this program. Nothing is changed.
+
+**System folders.** In `/usr/bin` and `/usr/sbin` every file should come from a
+package: one that does not is reported at once. In the parts of `/etc` that
+decide who logs in and what runs as root (`sudoers.d`, `pam.d`, `ld.so.conf.d`,
+`systemd/system`, the cron folders and a few more), a change is quiet when it
+is the package's own version of the file, as after an update, and reported
+otherwise.
+
+**Settings that leave a door open.** SSH that lets root or an empty password
+in, sudo rules that give root without a password, a folder on the search path
+that anyone can write to.
 
 **System file integrity.** Keeps a hash of a short list of files and says when
 one changes. A system update changes some of them legitimately, so every such
 issue offers "this was expected", which makes the new contents the reference.
 It also reports a library forced into every process that starts, which is how a
 rootkit hides.
+
+**Your own rules and indicators.** YARA files in `~/.config/grt-sentry/rules/`
+run with every scan, inside archives too. `~/.config/grt-sentry/indicators.txt`
+takes hashes, file names, paths and IP addresses, one per line, with a note
+after the first space; a match on a file, a running program or a connection is
+critical. Both change only when you edit them.
 
 **Packaged programs.** dpkg keeps an MD5 of every file it installs and rpm a
 SHA-256. Each program in `bin` and `sbin`, and each PAM module, which decides
@@ -108,6 +156,10 @@ and in two places the answer is narrower on Windows.
 | Pending updates | `apt`, security pocket only | `winget`, every pending upgrade |
 | Forced libraries | `/etc/ld.so.preload` | `AppInit_DLLs` |
 | Packaged programs | dpkg or rpm records | **not checked**: Windows keeps no record to compare against |
+| Processes | `/proc` | the process list and each program's path |
+| Hidden processes, ports, modules | compared against `/proc` and `/sys` | **not checked**: no second listing to compare |
+| Privileged files, system folders, SSH, sudo, PATH | checked | **not checked** |
+| Browser extensions | Firefox, Chrome, Chromium, Brave, Edge, Vivaldi | the same |
 | Scheduled scan | systemd user timer | Task Scheduler |
 | Administrator rights | `pkexec`, asked for per action | the whole program runs elevated, or not |
 
@@ -144,6 +196,10 @@ buttons. Destructive buttons ask for confirmation.
 | Failed logins from an address | Block address, Expected, Ignore |
 | A changed system file | This was expected, Ignore |
 | A system program that differs from its package | This was expected, Ignore |
+| A process running from somewhere odd | Stop process, Ignore |
+| A new kernel module, extension, account or privileged file | Expected, Ignore |
+| A changed file in a watched system folder | This was expected, Ignore |
+| Unreadable sudo rules | Read with administrator rights, Ignore |
 | Pending updates | Show the whole list, Ignore |
 | A new startup entry | Expected, Ignore |
 
@@ -198,6 +254,7 @@ was, so it fits into a script. It is also what the scheduled scan runs.
 |---|---|---|
 | Database and quarantine | `~/.local/share/grt-sentry/` | `%LOCALAPPDATA%\grt-sentry\` |
 | Configuration, including the API key | `~/.config/grt-sentry/config.toml` | `%APPDATA%\grt-sentry\config.toml` |
+| Your rules and indicators | `~/.config/grt-sentry/rules/`, `indicators.txt` | `%APPDATA%\grt-sentry\rules\`, `indicators.txt` |
 
 The configuration file is written with mode 0600 on Linux, and on Windows it
 inherits the profile's own permissions. Quarantined files are renamed to a
@@ -230,7 +287,7 @@ during a scan and nothing else.
 cd src-tauri && cargo test
 ```
 
-176 tests. Among them: with no key and no network, EICAR is found on its own
+222 tests. Among them: with no key and no network, EICAR is found on its own
 and inside a zip; a zip, a gzip and a tar.gz bomb are each stopped and named,
 and an honest log file that compresses well is not; a replaced program in a fake
 dpkg tree is found and an untouched one is not; every rule has a sample it must
@@ -239,7 +296,11 @@ and a port check through `/dev/tcp`; a file is re-hashed when its size or
 modification time change and skipped when they do not; VirusTotal requests are
 exactly the configured interval apart; a quarantined file crossing a filesystem
 boundary is copied, verified against its hash and only then removed; and a scan
-where every module is unavailable still produces a result. No malware sample is
+where every module is unavailable still produces a result; a module that hides
+from /proc/modules, a second root account, a sudo rule without a password, a
+command linked into /tmp, a Firefox extension sideloaded by another program and
+a `.bashrc` line that opens a reverse shell are each found, and an update that
+ships a new version of a PAM file is not reported. No malware sample is
 stored anywhere: EICAR is built at run time, and the rest are a line or two of
 text.
 
@@ -248,10 +309,24 @@ text.
 ```
 
 Runs the rules and the archive reader over every file under `/usr`, `/etc` and
-`/opt` and counts what they would report. The budget for a clean machine is
-zero, and it is checked on every push. On a desktop Debian install:
+`/opt` and counts what they would report, then every system check twice on the
+machine it runs on. The budget for a clean machine is zero in both, and the
+first half is checked on every push. On a desktop Debian install:
 190,000 files, 9 GB and 177,000 archive members in 83 seconds, no alarms, and
 171 MB of memory at the peak.
+
+```bash
+./scripts/test-planted.py <debian-live.iso> <grt-sentry.deb>
+```
+
+Boots a Debian live image in QEMU with no network, installs the package, and
+scans the untouched system as the live user and as root: neither may raise an
+alarm. Then it plants 25 samples, among them a replaced `whoami`, a
+set-user-ID shell in `/tmp`, a cron job and a systemd unit, a second root
+account, a sudo rule without a password, a process run from a deleted file,
+and a library in `/etc/ld.so.preload` that hides a process from every listing
+of `/proc`. All 25 must be named. Last run: 25 of 25, no alarm on the clean
+image, the profile in enforce and no AppArmor denial.
 
 ```bash
 ./scripts/check-weight.sh
@@ -281,6 +356,12 @@ To look at the interface without building anything:
   clean bill of health.
 - The package check covers programs and PAM modules, not libraries. A replaced
   `libc` is outside it.
+- An ordinary user sees only part of the machine: processes of other users,
+  `/etc/sudoers` and `/etc/sudoers.d` are root's, and TCP ports below 1024
+  cannot be probed. `sudo grt-sentry --scan` sees all of it.
+- A rootkit in the kernel can lie to both listings at once. What is compared
+  here catches the ones that lie to one, which is most of them; for the rest,
+  boot from a live USB and look from outside.
 - The geolocation says where the network announcing an address is registered.
   That is a data centre or a provider, not a person and not a street.
 - Blocking an address stops this machine reaching it. It is an outbound rule,

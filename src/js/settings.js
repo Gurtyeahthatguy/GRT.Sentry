@@ -37,6 +37,7 @@ function fill(config) {
   document.getElementById("deep-scan").checked = config.deep_scan;
   document.getElementById("skip-folders").value = config.skip_folders.join("\n");
   document.getElementById("check-packages").checked = config.check_packages;
+  document.getElementById("check-system").checked = config.check_system;
   document.getElementById("scan-on-startup").checked = config.scan_on_startup;
   document.getElementById("watch-folders").checked = config.watch_folders;
   document.getElementById("auto-quarantine").checked = config.auto_quarantine;
@@ -71,6 +72,7 @@ async function save(onThemeChange) {
     deep_scan: document.getElementById("deep-scan").checked,
     skip_folders: lines("skip-folders"),
     check_packages: document.getElementById("check-packages").checked,
+    check_system: document.getElementById("check-system").checked,
     scan_on_startup: document.getElementById("scan-on-startup").checked,
     auto_quarantine: document.getElementById("auto-quarantine").checked,
     auto_quarantine_threshold: number("auto-threshold"),
@@ -182,6 +184,18 @@ async function loadFacts() {
     ["quarantine", info.quarantine_path],
     ["files in cache", formatCount(info.cached_files)],
     ["detection rules", `${formatCount(info.rule_count)}, version ${info.rules_version}`],
+    [
+      "your own rules",
+      info.own_rule_files > 0
+        ? `${formatCount(info.own_rule_files)} file(s) in ${info.own_rules_dir}`
+        : `none; YARA files put in ${info.own_rules_dir} are run with every scan`,
+    ],
+    [
+      "your indicators",
+      info.indicator_count > 0
+        ? `${formatCount(info.indicator_count)} in ${info.indicators_path}`
+        : `none; hashes, file names, paths and addresses, one per line, go in ${info.indicators_path}`,
+    ],
     ["files in quarantine", formatCount(info.quarantined_files)],
     ["geolocation data", info.geoip_available ? info.geoip_path : "not installed, so connections show no place"],
     [

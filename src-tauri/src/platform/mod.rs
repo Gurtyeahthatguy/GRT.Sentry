@@ -82,3 +82,64 @@ pub fn autostart_entry_path(key: &str) -> Option<PathBuf> {
     let (source, file) = key.split_once(':')?;
     entry_path_for(source, file)
 }
+
+/// A running process, as far as this user can see it.
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: i32,
+    pub name: String,
+    /// What the executable link says, " (deleted)" included, when readable.
+    pub exe: Option<String>,
+}
+
+/// A process the kernel answers for but the process list leaves out.
+#[derive(Debug, Clone)]
+pub struct HiddenProcess {
+    pub pid: i32,
+    pub name: String,
+}
+
+/// The loaded kernel modules, from the two places that list them.
+#[derive(Debug, Clone, Default)]
+pub struct KernelModules {
+    /// Names in /proc/modules.
+    pub listed: Vec<String>,
+    /// Loadable modules in /sys/module, with their taint letters.
+    pub sysfs: Vec<(String, String)>,
+}
+
+/// A file with set-user-ID, set-group-ID or capabilities.
+#[derive(Debug, Clone)]
+pub struct SpecialFile {
+    pub path: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Permitted capabilities as a bit mask, when the file carries any.
+    pub capabilities: Option<u64>,
+}
+
+/// Which family a browser belongs to, which decides how its records read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BrowserKind {
+    Firefox,
+    Chromium,
+}
+
+/// An account in the password database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Account {
+    pub name: String,
+    pub uid: u32,
+    pub shell: String,
+}
+
+/// A directory on the search path, and what about it is unsafe.
+#[derive(Debug, Clone, Default)]
+pub struct PathEntry {
+    pub dir: String,
+    pub world_writable: bool,
+    pub sticky: bool,
+    /// Programs in it that anyone may overwrite.
+    pub writable_files: Vec<String>,
+}

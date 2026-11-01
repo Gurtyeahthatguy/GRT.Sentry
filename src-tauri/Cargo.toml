@@ -1,6 +1,6 @@
 [package]
 name = "grt-sentry"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local security scanner: checks files, connections and system state on demand"
 authors = ["GRT Project"]
 license = "MIT"
@@ -43,9 +43,12 @@ sevenz-rust2 = { version = "0.24", default-features = false }
 # dpkg records MD5, so the package check needs it.
 md-5 = "0.10"
 
-# Reading /proc, which is where Linux keeps the socket table.
+# Reading /proc, which is where Linux keeps the socket table; capabilities
+# are read with getxattr, and ports are probed with a bind that never listens.
 [target.'cfg(not(windows))'.dependencies]
 procfs = "0.16"
+libc = "0.2"
+socket2 = "0.6"
 
 # On Linux, rustls keeps the TLS stack inside the binary and off the system.
 # On Windows, SChannel is the system stack and needs no C compiler to build.

@@ -54,6 +54,11 @@ pub fn parse_line(line: &str, now: i64) -> Option<Failure> {
     Some(Failure { timestamp, address: extract_address(line), user: extract_user(line) })
 }
 
+/// When a line of the record was written.
+pub fn timestamp_of(line: &str, now: i64) -> Option<i64> {
+    parse_timestamp(line, now)
+}
+
 /// Handles both timestamp styles found in the wild.
 ///
 /// Modern rsyslog writes RFC 3339. Traditional syslog carries no year, so the
@@ -134,8 +139,16 @@ pub fn summarise(text: &str, now: i64) -> (HashMap<String, Vec<Failure>>, usize)
 }
 
 /// Issues for the addresses that went over the threshold.
-pub fn findings(_conn: &Connection, log_path: &str, threshold: u32) -> Vec<Finding> {
-    let text = match platform::read_auth_log(log_path) {
+pub fn findings(conn: &Connection, log_path: &str, threshold: u32) -> Vec<Finding> {
+    // Systems that no longer write the file keep the same lines in the journal.
+    let access = match platform::read_auth_log(log_path) {
+        LogAccess::Ok(text) => LogAccess::Ok(text),
+        other => match platform::journal_auth() {
+            LogAccess::Ok(text) => LogAccess::Ok(text),
+            _ => other,
+        },
+    };
+    let text = match access {
         LogAccess::Ok(text) => text,
         LogAccess::Denied => {
             return vec![Finding::new(
@@ -164,7 +177,10 @@ pub fn findings(_conn: &Connection, log_path: &str, threshold: u32) -> Vec<Findi
         }
     };
 
-    findings_from_text(&text, threshold, crate::db::now())
+    let now = crate::db::now();
+    let mut found = findings_from_text(&text, threshold, now);
+    found.extend(crate::accounts::login_findings(conn, &text, now));
+    found
 }
 
 /// The part that does not touch the filesystem, so it can be tested.
@@ -350,10 +366,12 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn a_log_that_is_not_there_is_reported_as_a_fact_not_a_failure() {
+        // Where the journal is readable it stands in for the file, so the
+        // claim is only that a missing file never becomes an alarm.
         let conn = crate::db::open_memory();
         let found = findings(&conn, "/nonexistent/auth.log", 5);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].issue.severity, Severity::Info);
-        assert_eq!(found[0].issue.kind, IssueKind::ModuleUnavailable);
+        for finding in found.iter().filter(|f| f.issue.kind == IssueKind::ModuleUnavailable) {
+            assert_eq!(finding.issue.severity, Severity::Info);
+        }
     }
 }

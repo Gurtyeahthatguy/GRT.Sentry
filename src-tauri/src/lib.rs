@@ -9,23 +9,31 @@
 //! process owns and used from Rust, and the settings tab is told only whether
 //! a key is set and how it ends.
 
+mod accounts;
 mod actionlog;
 mod allowlist;
+mod audit;
 mod authlog;
 mod autostart;
 mod cli;
 mod config;
 mod content;
 mod dashboard;
+mod extensions;
+mod folders;
 mod db;
 mod geoip;
+mod indicators;
 mod integrity;
 mod netmon;
 mod packages;
 mod paths;
 mod platform;
+mod privilege;
+mod processes;
 mod quarantine;
 mod resolve;
+mod rootkit;
 mod rules;
 mod scanner;
 mod schedule;
@@ -293,12 +301,38 @@ async fn resolve_issue(
             format!("{path} will not be reported again unless it changes.")
         }
 
+        (IssueTarget::Process { pid, name }, "kill_process") => {
+            resolve::kill_process(&conn, *pid, Some(name))?;
+            format!("Asked {name} (pid {pid}) to stop.")
+        }
+        (IssueTarget::Baseline { kind, key, value }, "trust" | "update_baseline") => {
+            resolve::accept_baseline(&conn, kind, key, value)?;
+            "That is the new normal; it will not be reported again unless it changes.".to_string()
+        }
+
         (IssueTarget::Autostart { key, name }, "trust") => {
             autostart::accept(&conn, key, name)?;
             format!("{name} is expected from now on.")
         }
 
         (IssueTarget::Packages { names }, "list_packages") => names.join(", "),
+
+        (IssueTarget::Informational, "read_sudoers") => {
+            let text = platform::sudoers_privileged()?;
+            let found = audit::sudo_findings(&text);
+            let count = found.len();
+            let mut snapshot = state.snapshot.lock().unwrap();
+            for finding in found {
+                snapshot.targets.insert(finding.issue.id.clone(), finding.target);
+                snapshot.status.issues.push(finding.issue);
+            }
+            snapshot.status.finish();
+            if count == 0 {
+                "The sudo rules were read: none gives root without a password.".to_string()
+            } else {
+                format!("The sudo rules were read: {count} thing(s) worth seeing were added to the list.")
+            }
+        }
 
         (IssueTarget::Informational, "read_authlog") => {
             let path = { state.config.lock().unwrap().auth_log_path.clone() };
@@ -460,6 +494,10 @@ struct SystemInfo {
     cached_files: i64,
     rule_count: usize,
     rules_version: String,
+    own_rules_dir: String,
+    own_rule_files: usize,
+    indicators_path: String,
+    indicator_count: usize,
     quarantined_files: usize,
     recent_scans: Vec<ScanRecord>,
     schedule: schedule::ScheduleStatus,
@@ -485,6 +523,10 @@ fn system_info(state: State<'_, AppState>, watcher_state: State<'_, WatcherState
         cached_files: db::cached_file_count(&conn),
         rule_count: rules::count(),
         rules_version: rules::version().to_string(),
+        own_rules_dir: indicators::rules_dir().to_string_lossy().into_owned(),
+        own_rule_files: indicators::load_rules().files,
+        indicators_path: indicators::indicators_path().to_string_lossy().into_owned(),
+        indicator_count: indicators::Indicators::load().len(),
         quarantined_files: db::list_quarantine(&conn).map(|q| q.len()).unwrap_or(0),
         recent_scans: db::recent_scans(&conn, 10).unwrap_or_default(),
         schedule: schedule::status(),
