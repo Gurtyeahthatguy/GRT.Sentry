@@ -15,13 +15,16 @@ GRT Sentry, a local security scanner
   grt-sentry                 open the window
   grt-sentry --scan          run a scan without a window and print the result
   grt-sentry --status        print the result of the last scan
+  grt-sentry --report        print the last scan in full, to save or send
+  grt-sentry --compare       print what changed between the last two scans
   grt-sentry --connections   list the active network connections
   grt-sentry --where         print where the data, configuration and quarantine live
   grt-sentry --version       print the version
   grt-sentry --help          print this
 
 Exit status of --scan: 0 when nothing above information was found, 1 when
-something was, 2 when the scan itself could not run.
+something was, 2 when the scan itself could not run. What was set aside does
+not count, and the notification only comes for something new.
 ";
 
 /// Runs a command-line mode if one was asked for, and reports the exit code.
@@ -43,6 +46,8 @@ pub fn maybe_run() -> Option<i32> {
         "--where" => Some(print_locations()),
         "--scan" => Some(headless_scan()),
         "--status" => Some(print_last_status()),
+        "--report" => Some(print_report(false)),
+        "--compare" => Some(print_report(true)),
         "--connections" => Some(print_connections()),
         _ => None,
     }
@@ -137,6 +142,26 @@ fn print_last_status() -> i32 {
     }
 }
 
+fn print_report(compare: bool) -> i32 {
+    let Ok(state) = state() else { return 2 };
+    let conn = state.db.lock().unwrap();
+    let text = if compare {
+        crate::report::comparison(&conn, None, None).map(|c| crate::report::render_comparison(&c))
+    } else {
+        crate::report::scan_text(&conn, None)
+    };
+    match text {
+        Ok(text) => {
+            print!("{text}");
+            0
+        }
+        Err(e) => {
+            eprintln!("grt-sentry: {e}");
+            2
+        }
+    }
+}
+
 fn print_connections() -> i32 {
     let Ok(state) = state() else { return 2 };
     let conn = state.db.lock().unwrap();
@@ -171,47 +196,53 @@ fn print_status(status: &SystemStatus) {
     if status.clean {
         println!("Nothing needs attention. {counts}.");
     } else {
-        let serious = status.issues.iter().filter(|i| i.severity != Severity::Info).count();
+        let serious = status.issues.iter().filter(|i| i.counts()).count();
         let plural = if serious == 1 { "thing needs" } else { "things need" };
-        println!("{serious} {plural} attention. {counts}.");
+        let new = if status.new_issues > 0 { format!(", {} new", status.new_issues) } else { String::new() };
+        println!("{serious} {plural} attention{new}. {counts}.");
     }
 
     for issue in &status.issues {
         let mark = match issue.severity {
+            _ if issue.set_aside => " -",
             Severity::Critical => "!!",
             Severity::Warning => " !",
             Severity::Info => "  ",
         };
-        println!("{mark} {}\n     {}", issue.title, issue.location);
+        let note = if issue.set_aside {
+            "  (set aside)"
+        } else if issue.is_new() {
+            "  (new)"
+        } else {
+            ""
+        };
+        println!("{mark} {}{note}\n     {}", issue.title, issue.location);
     }
 }
 
-/// A desktop notification, when there is a desktop to notify.
+/// A desktop notification, only when something new needs attention.
+///
+/// What a daily scan already said yesterday is not news, so it stays quiet.
 fn notify_if_needed(status: &SystemStatus) {
-    let serious = status.issues.iter().filter(|i| i.severity != Severity::Info).count();
-    if serious == 0 {
-        return;
+    let Some(message) = notification(status) else { return };
+    let urgent = status.issues.iter().any(|i| i.is_new() && i.severity == Severity::Critical);
+    crate::platform::notify("GRT Sentry", &message, urgent);
+}
+
+fn notification(status: &SystemStatus) -> Option<String> {
+    let new = status.new_issues as usize;
+    if new == 0 {
+        return None;
     }
-
-    let urgent = status.issues.iter().any(|i| i.severity == Severity::Critical);
-    let plural = if serious == 1 { "thing needs" } else { "things need" };
-
-    crate::platform::notify(
-        "GRT Sentry",
-        &format!("{serious} {plural} attention. Open GRT Sentry to see them."),
-        urgent,
-    );
+    let serious = status.issues.iter().filter(|i| i.counts()).count();
+    let what = if new == 1 { "1 new thing needs attention".to_string() } else { format!("{new} new things need attention") };
+    let rest = if serious > new { format!(", {serious} in all") } else { String::new() };
+    Some(format!("{what}{rest}. Open GRT Sentry to see them."))
 }
 
 fn format_time(timestamp: i64) -> String {
-    chrono::Local
-        .timestamp_opt(timestamp, 0)
-        .single()
-        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| timestamp.to_string())
+    crate::report::local_time(timestamp)
 }
-
-use chrono::TimeZone;
 
 /// Stops a running scan, which is the same flag the headless scan honours.
 pub fn cancel(state: &AppState) {
@@ -229,8 +260,21 @@ mod tests {
     }
 
     #[test]
+    fn only_something_new_makes_a_notification() {
+        use crate::state::Issue;
+        let seen = |times: u32| Issue { severity: Severity::Warning, times_seen: times, ..Default::default() };
+        let mut status = SystemStatus { issues: vec![seen(3), seen(5)], ..Default::default() };
+        status.finish();
+        assert!(notification(&status).is_none(), "yesterday's news stays quiet");
+
+        status.issues.push(seen(1));
+        status.finish();
+        assert_eq!(notification(&status).unwrap(), "1 new thing needs attention, 3 in all. Open GRT Sentry to see them.");
+    }
+
+    #[test]
     fn the_usage_text_lists_every_mode_the_parser_accepts() {
-        for mode in ["--scan", "--status", "--connections", "--where", "--version", "--help"] {
+        for mode in ["--scan", "--status", "--report", "--compare", "--connections", "--where", "--version", "--help"] {
             assert!(USAGE.contains(mode), "{mode} is accepted but not documented");
         }
     }

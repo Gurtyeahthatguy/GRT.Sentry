@@ -1,6 +1,6 @@
 # Installing GRT Sentry
 
-The program is at version **0.3.0**, and the same version runs on Linux and on
+The program is at version **0.4.0**, and the same version runs on Linux and on
 Windows.
 
 ---
@@ -14,19 +14,19 @@ be installed to use them.
 no administrator rights, and it runs from anywhere:
 
 ```bash
-chmod +x grt-sentry-0.3.0-linux-x86_64.AppImage
-./grt-sentry-0.3.0-linux-x86_64.AppImage
+chmod +x grt-sentry-0.4.0-linux-x86_64.AppImage
+./grt-sentry-0.4.0-linux-x86_64.AppImage
 ```
 
 The `.deb` and `.rpm` beside it install through the package manager instead,
 which puts the program in the application menu:
 
 ```bash
-sudo apt install ./grt-sentry-0.3.0-linux-x86_64.deb     # Debian, Ubuntu
-sudo dnf install ./grt-sentry-0.3.0-linux-x86_64.rpm     # Fedora
+sudo apt install ./grt-sentry-0.4.0-linux-x86_64.deb     # Debian, Ubuntu
+sudo dnf install ./grt-sentry-0.4.0-linux-x86_64.rpm     # Fedora
 ```
 
-**Windows.** Take `grt-sentry-0.3.0-windows-x86_64-setup.exe`. The plain `.exe`
+**Windows.** Take `grt-sentry-0.4.0-windows-x86_64-setup.exe`. The plain `.exe`
 beside it is the same program with no installer, for a portable copy. Neither
 is code-signed, so Windows will warn about an unknown publisher.
 
@@ -101,9 +101,11 @@ over is checked by the next scan.
 sudo ./scripts/setup-nftables.sh
 ```
 
-That creates an nftables table with two empty sets and a rule that drops
-traffic to whatever is in them. Blocking an address adds one element to a set;
-the program never writes rules. To see what is blocked:
+That creates an nftables table with four empty sets and the rules that drop
+traffic to whatever is in them. Two of the sets let each address go after 24
+hours, for the automatic response. Blocking an address adds one element to a
+set; the program never writes rules. A table made before 0.4 needs the script
+once more, which only adds what is missing. To see what is blocked:
 
 ```bash
 sudo nft list table inet grtsentry

@@ -13,6 +13,7 @@
         <button class="tab is-active" data-tab="status">Status</button>
         <button class="tab" data-tab="connections">Connections</button>
         <button class="tab" data-tab="quarantine">Quarantine</button>
+        <button class="tab" data-tab="history">History</button>
         <button class="tab" data-tab="settings">Settings</button>
       </nav>
       <div class="chrome-end"><span id="version" class="dim"></span></div>
@@ -49,6 +50,7 @@
       <section class="panel" id="panel-connections">
         <div class="toolbar">
           <button id="btn-refresh-connections">Refresh</button>
+          <button id="btn-read-capture">Read a capture…</button>
           <input type="search" id="connection-filter" placeholder="Filter by process, address or place" />
           <label class="check"><input type="checkbox" id="hide-private" checked /> Hide local network</label>
           <span class="dim" id="connection-count"></span>
@@ -69,6 +71,7 @@
           </table>
         </div>
         <div class="pager" id="connections-pager"></div>
+        <div id="capture" class="capture" hidden></div>
         <p class="footnote dim">
           A location says where the network announcing the address is registered, usually a data
           centre or a provider. It is not where a person is, and it is not a street address.
@@ -97,6 +100,17 @@
 
         <h2>Trusted addresses</h2>
         <div id="trusted-ips" class="cards"></div>
+      </section>
+
+      <!-- History ------------------------------------------------------>
+      <section class="panel" id="panel-history">
+        <h2>Past scans</h2>
+        <p class="dim">
+          Each scan as a report to read or save, and what changed from the one before it. The
+          latest hundred keep everything they found; older ones keep only their counts.
+        </p>
+        <div id="scan-list" class="cards"></div>
+        <div id="history-output" class="history-output" hidden></div>
       </section>
 
       <!-- Settings ----------------------------------------------------->
@@ -159,6 +173,15 @@
         <div class="field">
           <label for="auto-threshold">Engines needed for that</label>
           <input type="number" id="auto-threshold" min="1" max="100" />
+        </div>
+        <label class="check"><input type="checkbox" id="auto-block" /> Offer to block addresses that keep failing to log in</label>
+        <div class="field">
+          <label for="auto-block-after">Failed logins in a day before that</label>
+          <input type="number" id="auto-block-after" min="3" max="1000" />
+          <p class="hint dim">
+            One button blocks them all, with one password, for 24 hours. A scan run as root blocks
+            them without asking. Either way the action log can lift a block sooner.
+          </p>
         </div>
 
         <h2>Scheduled scan</h2>

@@ -1,7 +1,8 @@
 // The Connections tab: what this machine is talking to.
 
 import { api, dialog } from "./api.js";
-import { button, clear, el, errorText, paginate, toast } from "./ui.js";
+import { button, clear, el, errorText, formatCount, formatSize, paginate, toast } from "./ui.js";
+import { refreshStatus } from "./status.js";
 
 const PAGE_SIZE = 60;
 
@@ -12,6 +13,65 @@ export function initConnections() {
   document.getElementById("btn-refresh-connections").addEventListener("click", () => load());
   document.getElementById("connection-filter").addEventListener("input", draw);
   document.getElementById("hide-private").addEventListener("change", draw);
+  document.getElementById("btn-read-capture").addEventListener("click", readCapture);
+}
+
+/** A pcap or pcapng the user recorded, held up against the indicators. */
+async function readCapture() {
+  const chosen = await dialog.open({
+    multiple: false,
+    title: "Choose a saved capture",
+    filters: [{ name: "Captures", extensions: ["pcap", "pcapng", "cap"] }],
+  });
+  if (!chosen) return;
+
+  const node = document.getElementById("capture");
+  let capture;
+  try {
+    toast("Reading the capture…");
+    capture = await api.readCapture(chosen);
+  } catch (error) {
+    toast(errorText(error), true);
+    return;
+  }
+
+  clear(node);
+  node.hidden = false;
+  node.append(el("h2", null, chosen.split(/[\\/]/).pop()));
+  const flagged = capture.flows.filter((f) => f.indicator).length;
+  const summary = [
+    `${formatCount(capture.packets)} packets, ${formatCount(capture.flow_count)} conversations`,
+    capture.other > 0 ? `${formatCount(capture.other)} packets that are not IP` : null,
+    flagged > 0
+      ? `${flagged} conversation${flagged === 1 ? "" : "s"} with an address from your indicators, added to Status`
+      : "no address from your indicators",
+  ].filter(Boolean);
+  node.append(el("p", "dim", summary.join(" · ")));
+  if (capture.note) node.append(el("p", "dim", capture.note));
+
+  const table = el("table", "grid");
+  const head = el("tr");
+  for (const name of ["From", "To", "Protocol", "Packets", "Bytes", "Indicator"]) head.append(el("th", null, name));
+  table.append(el("thead"));
+  table.firstChild.append(head);
+  const body = el("tbody");
+  for (const flow of capture.flows) {
+    const row = el("tr", flow.indicator ? "is-flagged" : "");
+    row.append(el("td", "mono", flow.from), el("td", "mono", flow.to));
+    row.append(el("td", "mono", flow.port ? `${flow.port}/${flow.protocol}` : flow.protocol));
+    row.append(el("td", null, formatCount(flow.packets)), el("td", null, formatSize(flow.bytes)));
+    row.append(el("td", null, flow.indicator || ""));
+    body.append(row);
+  }
+  table.append(body);
+  const scroll = el("div", "table-scroll");
+  scroll.append(table);
+  node.append(scroll);
+  if (capture.flow_count > capture.flows.length) {
+    node.append(el("p", "dim", `The ${formatCount(capture.flows.length)} biggest are listed.`));
+  }
+  node.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (capture.added > 0) refreshStatus();
 }
 
 /** Reads the current sockets, when the tab is opened. */

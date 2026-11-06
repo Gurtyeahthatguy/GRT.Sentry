@@ -138,9 +138,11 @@ pub fn login_findings(conn: &Connection, text: &str, now: i64) -> Vec<Finding> {
     // sudo, by user.
     let first_sudo = !db::baseline_started(conn, SUDO_USERS);
     let mut refused: Vec<String> = Vec::new();
+    let mut reported: Vec<&str> = Vec::new();
     for event in &events {
         match event {
-            Event::Sudo { user } if db::baseline_value(conn, SUDO_USERS, user).is_none() => {
+            Event::Sudo { user } if db::baseline_value(conn, SUDO_USERS, user).is_none() && !reported.contains(&user.as_str()) => {
+                reported.push(user);
                 if !first_sudo {
                     out.push(Finding::new(
                         Issue {
@@ -156,8 +158,10 @@ pub fn login_findings(conn: &Connection, text: &str, now: i64) -> Vec<Finding> {
                         },
                         IssueTarget::Baseline { kind: SUDO_USERS.to_string(), key: user.clone(), value: "seen".to_string() },
                     ));
+                } else {
+                    // Reported until "Expected", while the log still holds it.
+                    let _ = db::set_baseline_value(conn, SUDO_USERS, user, "seen");
                 }
-                let _ = db::set_baseline_value(conn, SUDO_USERS, user, "seen");
             }
             Event::SudoRefused { user } => refused.push(user.clone()),
             _ => {}
@@ -294,6 +298,14 @@ mod tests {
         assert!(titles.contains(&"www used sudo for the first time".to_string()), "{titles:?}");
         assert!(titles.contains(&"guest tried sudo without the right to".to_string()));
         assert_eq!(found.len(), 2);
+
+        // Twice in the log is one card, and it is still there next time.
+        let twice = format!("{day_two}Oct 30 11:05:00 host sudo:   www : TTY=pts/2 ; PWD=/ ; USER=root ; COMMAND=/bin/ls\n");
+        let again = login_findings(&conn, &twice, now);
+        assert_eq!(again.iter().filter(|f| f.issue.title.starts_with("www used sudo")).count(), 1);
+
+        crate::resolve::accept_baseline(&conn, SUDO_USERS, "www", "seen").unwrap();
+        assert!(!login_findings(&conn, &twice, now).iter().any(|f| f.issue.title.starts_with("www")));
     }
 
     #[test]

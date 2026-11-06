@@ -33,6 +33,7 @@ pub fn block_ip(conn: &Connection, raw: &str) -> Result<(), String> {
     }
 
     platform::block_address(&ip)?;
+    let _ = db::put_block(conn, &ip.to_string(), None);
     actionlog::record(conn, actionlog::kind::BLOCK_IP, &ip.to_string(), Some("blocked from the dashboard"), true);
     Ok(())
 }
@@ -41,6 +42,7 @@ pub fn block_ip(conn: &Connection, raw: &str) -> Result<(), String> {
 pub fn unblock_ip(conn: &Connection, raw: &str) -> Result<(), String> {
     let ip: IpAddr = raw.trim().parse().map_err(|_| format!("{raw} is not an IP address."))?;
     platform::unblock_address(&ip)?;
+    let _ = db::remove_block(conn, &ip.to_string());
     actionlog::record(conn, actionlog::kind::UNBLOCK_IP, &ip.to_string(), Some("unblocked"), false);
     Ok(())
 }
@@ -168,6 +170,7 @@ pub fn revert(conn: &Connection, action_id: i64) -> Result<String, String> {
             unblock_ip(conn, &record.target)?;
             format!("{} is no longer blocked.", record.target)
         }
+        actionlog::kind::AUTO_BLOCK => crate::response::lift(conn, &record.target)?,
         actionlog::kind::QUARANTINE => {
             // The log stores where the file came from, the quarantine table
             // where it went.

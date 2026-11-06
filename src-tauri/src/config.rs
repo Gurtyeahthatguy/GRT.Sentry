@@ -65,6 +65,11 @@ pub struct Config {
     pub auth_log_path: String,
     pub failed_login_threshold: u32,
 
+    /// Block, or offer to block, addresses past this many failed logins. Off
+    /// by default.
+    pub auto_block: bool,
+    pub auto_block_after: u32,
+
     /// Run a quick scan as soon as the window opens.
     pub scan_on_startup: bool,
 
@@ -91,6 +96,8 @@ impl Default for Config {
             integrity_paths: platform::default_integrity_paths(),
             auth_log_path: platform::default_auth_log(),
             failed_login_threshold: 5,
+            auto_block: false,
+            auto_block_after: 10,
             scan_on_startup: true,
             theme: "system".to_string(),
         }
@@ -184,6 +191,8 @@ pub struct ConfigView {
     pub integrity_paths: Vec<String>,
     pub auth_log_path: String,
     pub failed_login_threshold: u32,
+    pub auto_block: bool,
+    pub auto_block_after: u32,
     pub scan_on_startup: bool,
     pub theme: String,
 }
@@ -212,6 +221,8 @@ impl From<&Config> for ConfigView {
             integrity_paths: c.integrity_paths.clone(),
             auth_log_path: c.auth_log_path.clone(),
             failed_login_threshold: c.failed_login_threshold,
+            auto_block: c.auto_block,
+            auto_block_after: c.auto_block_after,
             scan_on_startup: c.scan_on_startup,
             theme: c.theme.clone(),
         }
@@ -241,6 +252,8 @@ pub struct ConfigUpdate {
     pub integrity_paths: Option<Vec<String>>,
     pub auth_log_path: Option<String>,
     pub failed_login_threshold: Option<u32>,
+    pub auto_block: Option<bool>,
+    pub auto_block_after: Option<u32>,
     pub scan_on_startup: Option<bool>,
     pub theme: Option<String>,
 }
@@ -301,6 +314,12 @@ impl ConfigUpdate {
         }
         if let Some(v) = self.failed_login_threshold {
             config.failed_login_threshold = v.clamp(1, 1000);
+        }
+        if let Some(v) = self.auto_block {
+            config.auto_block = v;
+        }
+        if let Some(v) = self.auto_block_after {
+            config.auto_block_after = v.clamp(3, 1000);
         }
         if let Some(v) = self.scan_on_startup {
             config.scan_on_startup = v;
@@ -369,6 +388,14 @@ mod tests {
         }
         .apply(&mut config);
         assert_eq!(config.skip_folders, vec!["target".to_string(), "dist".to_string()]);
+    }
+
+    #[test]
+    fn the_automatic_response_starts_off_and_never_fires_on_a_typo() {
+        let mut config = Config::default();
+        assert!(!config.auto_block);
+        ConfigUpdate { auto_block_after: Some(1), ..Default::default() }.apply(&mut config);
+        assert_eq!(config.auto_block_after, 3);
     }
 
     #[test]

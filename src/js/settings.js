@@ -42,6 +42,8 @@ function fill(config) {
   document.getElementById("watch-folders").checked = config.watch_folders;
   document.getElementById("auto-quarantine").checked = config.auto_quarantine;
   document.getElementById("auto-threshold").value = config.auto_quarantine_threshold;
+  document.getElementById("auto-block").checked = config.auto_block;
+  document.getElementById("auto-block-after").value = config.auto_block_after;
   document.getElementById("auth-log").value = config.auth_log_path;
   document.getElementById("login-threshold").value = config.failed_login_threshold;
   document.getElementById("integrity-paths").value = config.integrity_paths.join("\n");
@@ -76,6 +78,8 @@ async function save(onThemeChange) {
     scan_on_startup: document.getElementById("scan-on-startup").checked,
     auto_quarantine: document.getElementById("auto-quarantine").checked,
     auto_quarantine_threshold: number("auto-threshold"),
+    auto_block: document.getElementById("auto-block").checked,
+    auto_block_after: number("auto-block-after"),
     vt_interval_seconds: number("vt-interval"),
     vt_budget_per_scan: number("vt-budget"),
     connection_refresh_seconds: number("refresh-seconds"),
@@ -158,8 +162,8 @@ function showSchedule(schedule) {
 
   select.value = schedule.enabled && schedule.frequency ? schedule.frequency : "off";
   node.textContent = schedule.enabled
-    ? `On${schedule.next_run ? `. Next: ${schedule.next_run}` : "."} The scan runs without a window and sends a notification only if something needs attention.`
-    : "Off. A scheduled scan runs the same checks in the background and notifies you only when something is found.";
+    ? `On${schedule.next_run ? `. Next: ${schedule.next_run}` : "."} The scan runs without a window and sends a notification only when something new needs attention.`
+    : "Off. A scheduled scan runs the same checks in the background and notifies you only when something new is found.";
 }
 
 async function loadFacts() {

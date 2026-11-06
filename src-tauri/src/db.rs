@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::paths;
 
 /// Bumped when the schema changes in a way that needs migrating.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Seconds since the epoch.
 pub fn now() -> i64 {
@@ -159,6 +159,38 @@ fn apply_schema(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (kind, key)
         );
 
+        -- Every problem a scan has reported, by what stays the same about it.
+        CREATE TABLE IF NOT EXISTS issue_history (
+            fingerprint TEXT PRIMARY KEY,
+            kind        TEXT NOT NULL,
+            first_seen  INTEGER NOT NULL,
+            last_seen   INTEGER NOT NULL,
+            times_seen  INTEGER NOT NULL,
+            set_aside   INTEGER
+        );
+
+        -- What each recent scan reported, for reports and comparisons.
+        CREATE TABLE IF NOT EXISTS scan_issues (
+            scan_id     INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            severity    TEXT NOT NULL,
+            title       TEXT NOT NULL,
+            location    TEXT NOT NULL,
+            detail      TEXT,
+            first_seen  INTEGER NOT NULL,
+            times_seen  INTEGER NOT NULL,
+            set_aside   INTEGER NOT NULL
+        );
+
+        -- Addresses in the firewall's sets, and when an automatic block lifts.
+        CREATE TABLE IF NOT EXISTS blocked_ips (
+            ip         TEXT PRIMARY KEY,
+            blocked_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS scan_issues_scan ON scan_issues (scan_id);
         CREATE INDEX IF NOT EXISTS action_log_time ON action_log (timestamp DESC);
         CREATE INDEX IF NOT EXISTS scan_history_time ON scan_history (timestamp DESC);
         "#,
@@ -354,6 +386,14 @@ pub fn set_ip_trust(conn: &Connection, ip: &str, trusted: bool, label: Option<&s
     Ok(())
 }
 
+pub fn ip_trusted(conn: &Connection, ip: &str) -> bool {
+    conn.query_row("SELECT 1 FROM known_ips WHERE ip = ?1 AND trusted = 1", params![ip], |_| Ok(()))
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 pub fn list_trusted_ips(conn: &Connection) -> Result<Vec<IpRecord>, String> {
     let mut stmt = conn
         .prepare("SELECT ip, first_seen, last_seen, label, trusted FROM known_ips WHERE trusted = 1 ORDER BY last_seen DESC")
@@ -375,35 +415,225 @@ pub fn list_trusted_ips(conn: &Connection) -> Result<Vec<IpRecord>, String> {
 
 // --- scan history ---------------------------------------------------------
 
+/// Scans whose issues are kept; older ones keep only their counts.
+const SCANS_KEPT: i64 = 100;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanRecord {
+    pub id: i64,
     pub timestamp: i64,
     pub files_checked: i64,
     pub issues_found: i64,
 }
 
-pub fn record_scan(conn: &Connection, files_checked: u32, issues_found: usize) -> Result<(), String> {
+/// Records a scan and says which row it got.
+pub fn record_scan(conn: &Connection, files_checked: u32, issues_found: usize) -> Result<i64, String> {
     conn.execute(
         "INSERT INTO scan_history (timestamp, files_checked, issues_found) VALUES (?1, ?2, ?3)",
         params![now(), files_checked as i64, issues_found as i64],
     )
     .map_err(wrap)?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
+}
+
+fn row_to_scan(row: &rusqlite::Row) -> rusqlite::Result<ScanRecord> {
+    Ok(ScanRecord {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        files_checked: row.get(2).unwrap_or(0),
+        issues_found: row.get(3).unwrap_or(0),
+    })
 }
 
 pub fn recent_scans(conn: &Connection, limit: u32) -> Result<Vec<ScanRecord>, String> {
     let mut stmt = conn
-        .prepare("SELECT timestamp, files_checked, issues_found FROM scan_history ORDER BY timestamp DESC LIMIT ?1")
+        .prepare(
+            "SELECT id, timestamp, files_checked, issues_found FROM scan_history
+             ORDER BY timestamp DESC, id DESC LIMIT ?1",
+        )
+        .map_err(wrap)?;
+    let rows = stmt.query_map(params![limit], row_to_scan).map_err(wrap)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(wrap)
+}
+
+pub fn get_scan(conn: &Connection, id: i64) -> Result<Option<ScanRecord>, String> {
+    conn.query_row(
+        "SELECT id, timestamp, files_checked, issues_found FROM scan_history WHERE id = ?1",
+        params![id],
+        row_to_scan,
+    )
+    .optional()
+    .map_err(wrap)
+}
+
+/// An issue as a past scan reported it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredIssue {
+    pub fingerprint: String,
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub location: String,
+    pub detail: Option<String>,
+    pub first_seen: i64,
+    pub times_seen: u32,
+    pub set_aside: bool,
+}
+
+/// Keeps what a scan reported, and forgets the issues of scans past the limit.
+pub fn record_scan_issues(conn: &Connection, scan_id: i64, issues: &[StoredIssue]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(wrap)?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO scan_issues (scan_id, fingerprint, kind, severity, title, location, detail,
+                 first_seen, times_seen, set_aside) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .map_err(wrap)?;
+        for issue in issues {
+            stmt.execute(params![
+                scan_id,
+                issue.fingerprint,
+                issue.kind,
+                issue.severity,
+                issue.title,
+                issue.location,
+                issue.detail,
+                issue.first_seen,
+                issue.times_seen,
+                issue.set_aside as i64
+            ])
+            .map_err(wrap)?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM scan_issues WHERE scan_id NOT IN
+         (SELECT id FROM scan_history ORDER BY timestamp DESC, id DESC LIMIT ?1)",
+        params![SCANS_KEPT],
+    )
+    .map_err(wrap)?;
+    tx.commit().map_err(wrap)
+}
+
+pub fn scan_issues(conn: &Connection, scan_id: i64) -> Result<Vec<StoredIssue>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT fingerprint, kind, severity, title, location, detail, first_seen, times_seen, set_aside
+             FROM scan_issues WHERE scan_id = ?1 ORDER BY rowid",
+        )
         .map_err(wrap)?;
     let rows = stmt
-        .query_map(params![limit], |row| {
-            Ok(ScanRecord {
-                timestamp: row.get(0)?,
-                files_checked: row.get(1).unwrap_or(0),
-                issues_found: row.get(2).unwrap_or(0),
+        .query_map(params![scan_id], |row| {
+            Ok(StoredIssue {
+                fingerprint: row.get(0)?,
+                kind: row.get(1)?,
+                severity: row.get(2)?,
+                title: row.get(3)?,
+                location: row.get(4)?,
+                detail: row.get(5)?,
+                first_seen: row.get(6)?,
+                times_seen: row.get::<_, i64>(7)? as u32,
+                set_aside: row.get::<_, i64>(8)? != 0,
             })
         })
         .map_err(wrap)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(wrap)
+}
+
+// --- issue history --------------------------------------------------------
+
+/// What the history knew about an issue before this sighting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sighting {
+    pub first_seen: i64,
+    pub times_seen: u32,
+    pub set_aside: bool,
+}
+
+/// Counts one more sighting of an issue and returns its history.
+pub fn observe_issue(conn: &Connection, fingerprint: &str, kind: &str, at: i64) -> Result<Sighting, String> {
+    conn.execute(
+        "INSERT INTO issue_history (fingerprint, kind, first_seen, last_seen, times_seen)
+         VALUES (?1, ?2, ?3, ?3, 1)
+         ON CONFLICT(fingerprint) DO UPDATE SET last_seen = excluded.last_seen,
+             times_seen = issue_history.times_seen + 1",
+        params![fingerprint, kind, at],
+    )
+    .map_err(wrap)?;
+    issue_sighting(conn, fingerprint)?.ok_or_else(|| "The issue history lost a row.".to_string())
+}
+
+pub fn issue_sighting(conn: &Connection, fingerprint: &str) -> Result<Option<Sighting>, String> {
+    conn.query_row(
+        "SELECT first_seen, times_seen, set_aside FROM issue_history WHERE fingerprint = ?1",
+        params![fingerprint],
+        |row| {
+            Ok(Sighting {
+                first_seen: row.get(0)?,
+                times_seen: row.get::<_, i64>(1)? as u32,
+                set_aside: row.get::<_, Option<i64>>(2)?.is_some(),
+            })
+        },
+    )
+    .optional()
+    .map_err(wrap)
+}
+
+/// Sets an issue aside, or brings it back.
+pub fn set_issue_aside(conn: &Connection, fingerprint: &str, kind: &str, aside: bool) -> Result<(), String> {
+    let stamp = now();
+    conn.execute(
+        "INSERT INTO issue_history (fingerprint, kind, first_seen, last_seen, times_seen, set_aside)
+         VALUES (?1, ?2, ?3, ?3, 1, ?4)
+         ON CONFLICT(fingerprint) DO UPDATE SET set_aside = excluded.set_aside",
+        params![fingerprint, kind, stamp, if aside { Some(stamp) } else { None }],
+    )
+    .map_err(wrap)?;
+    Ok(())
+}
+
+// --- blocked addresses ----------------------------------------------------
+
+/// Notes that an address went into the firewall, until `expires_at` or for good.
+pub fn put_block(conn: &Connection, ip: &str, expires_at: Option<i64>) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO blocked_ips (ip, blocked_at, expires_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(ip) DO UPDATE SET blocked_at = excluded.blocked_at, expires_at = excluded.expires_at",
+        params![ip, now(), expires_at],
+    )
+    .map_err(wrap)?;
+    Ok(())
+}
+
+pub fn remove_block(conn: &Connection, ip: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM blocked_ips WHERE ip = ?1", params![ip]).map_err(wrap)?;
+    Ok(())
+}
+
+/// When the block on an address lifts: `Some(None)` for never, `None` for no block.
+pub fn block_expiry(conn: &Connection, ip: &str) -> Option<Option<i64>> {
+    conn.query_row("SELECT expires_at FROM blocked_ips WHERE ip = ?1", params![ip], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// Whether an address is blocked at this moment.
+#[cfg(test)]
+fn is_blocked(conn: &Connection, ip: &str, at: i64) -> bool {
+    match block_expiry(conn, ip) {
+        Some(None) => true,
+        Some(Some(expires)) => expires > at,
+        None => false,
+    }
+}
+
+/// Automatic blocks whose time is up.
+pub fn expired_blocks(conn: &Connection, at: i64) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT ip FROM blocked_ips WHERE expires_at IS NOT NULL AND expires_at <= ?1")
+        .map_err(wrap)?;
+    let rows = stmt.query_map(params![at], |r| r.get(0)).map_err(wrap)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(wrap)
 }
 
@@ -820,6 +1050,59 @@ mod tests {
 
         mark_baseline_started(&conn, "extension").unwrap();
         assert!(baseline_started(&conn, "extension"));
+    }
+
+    #[test]
+    fn an_issue_counts_its_sightings_and_keeps_being_set_aside() {
+        let conn = open_memory();
+        let first = observe_issue(&conn, "fp", "rule_match", 100).unwrap();
+        assert_eq!(first, Sighting { first_seen: 100, times_seen: 1, set_aside: false });
+
+        set_issue_aside(&conn, "fp", "rule_match", true).unwrap();
+        let second = observe_issue(&conn, "fp", "rule_match", 200).unwrap();
+        assert_eq!(second, Sighting { first_seen: 100, times_seen: 2, set_aside: true });
+
+        set_issue_aside(&conn, "fp", "rule_match", false).unwrap();
+        assert!(!issue_sighting(&conn, "fp").unwrap().unwrap().set_aside);
+    }
+
+    #[test]
+    fn only_the_latest_scans_keep_their_issues() {
+        let conn = open_memory();
+        let issue = |n: usize| StoredIssue {
+            fingerprint: format!("fp{n}"),
+            kind: "rule_match".into(),
+            severity: "warning".into(),
+            title: "t".into(),
+            location: "l".into(),
+            detail: None,
+            first_seen: 1,
+            times_seen: 1,
+            set_aside: false,
+        };
+        let mut ids = Vec::new();
+        for n in 0..(SCANS_KEPT as usize + 3) {
+            let id = record_scan(&conn, 1, 1).unwrap();
+            record_scan_issues(&conn, id, &[issue(n)]).unwrap();
+            ids.push(id);
+        }
+        assert!(scan_issues(&conn, ids[0]).unwrap().is_empty());
+        assert_eq!(scan_issues(&conn, *ids.last().unwrap()).unwrap()[0].fingerprint, format!("fp{}", ids.len() - 1));
+        assert_eq!(get_scan(&conn, ids[0]).unwrap().unwrap().id, ids[0], "the counts stay");
+    }
+
+    #[test]
+    fn an_automatic_block_lifts_and_a_manual_one_does_not() {
+        let conn = open_memory();
+        put_block(&conn, "203.0.113.5", Some(1_000)).unwrap();
+        put_block(&conn, "203.0.113.6", None).unwrap();
+        assert!(is_blocked(&conn, "203.0.113.5", 999));
+        assert!(!is_blocked(&conn, "203.0.113.5", 1_000));
+        assert!(is_blocked(&conn, "203.0.113.6", i64::MAX));
+        assert!(!is_blocked(&conn, "203.0.113.7", 0));
+        assert_eq!(expired_blocks(&conn, 1_000).unwrap(), vec!["203.0.113.5".to_string()]);
+        remove_block(&conn, "203.0.113.5").unwrap();
+        assert!(block_expiry(&conn, "203.0.113.5").is_none());
     }
 
     #[test]

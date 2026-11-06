@@ -94,12 +94,13 @@ profile grt-sentry /usr/bin/grt-sentry {
   /root/** r,
 
   # Read-only helpers: apt for updates, crontab and systemctl for startup
-  # entries, nft to see that it is there, dpkg because apt calls it, and
-  # journalctl for logins.
+  # entries, dpkg because apt calls it, and journalctl for logins.
   /usr/bin/apt ix,
   /usr/bin/crontab ix,
   /usr/bin/systemctl ix,
-  /usr/sbin/nft ix,
+  # nft runs under its own small profile, which may talk to the firewall; it
+  # only can when Sentry runs as root, and otherwise goes through pkexec.
+  /usr/sbin/nft Cx -> nft,
   /usr/bin/dpkg ix,
   # journalctl reads the authentication messages where auth.log is gone.
   /usr/bin/journalctl ix,
@@ -114,8 +115,9 @@ profile grt-sentry /usr/bin/grt-sentry {
   owner /run/user/@{uid}/systemd/private rw,
   owner /run/user/@{uid}/bus rw,
 
-  # Changing the firewall goes through pkexec, outside this profile.
-  /usr/bin/pkexec Px,
+  # Changing the firewall goes through pkexec, outside this profile: under
+  # pkexec's own profile where the system has one, and polkit asks first.
+  /usr/bin/pkexec PUx,
 
   # Opening a file in the user's own handler.
   /usr/bin/xdg-open Ux,
@@ -148,4 +150,15 @@ profile grt-sentry /usr/bin/grt-sentry {
   owner /run/user/@{uid}/{,**} rw,
   owner /tmp/{,**} rw,
   owner /dev/shm/** rw,
+
+  profile nft {
+    include <abstractions/base>
+    include <abstractions/nameservice>
+    /usr/sbin/nft mr,
+    /etc/iproute2/{,**} r,
+    /usr/share/iproute2/{,**} r,
+    @{PROC}/sys/net/** r,
+    capability net_admin,
+    network netlink raw,
+  }
 }

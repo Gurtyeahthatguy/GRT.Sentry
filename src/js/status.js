@@ -1,7 +1,18 @@
 // The Status tab: one verdict, then the list of things to decide about.
 
 import { api, dialog, listen } from "./api.js";
-import { button, clear, el, errorText, formatCount, formatSize, timeAgo, toast } from "./ui.js";
+import {
+  askWhereToSave,
+  button,
+  clear,
+  dateStamp,
+  el,
+  errorText,
+  formatCount,
+  formatSize,
+  timeAgo,
+  toast,
+} from "./ui.js";
 
 let scanning = false;
 
@@ -170,7 +181,8 @@ function showProgress(progress) {
 function render(status) {
   if (!status) return;
 
-  const serious = status.issues.filter((issue) => issue.severity !== "info");
+  const serious = status.issues.filter((issue) => issue.severity !== "info" && !issue.set_aside);
+  const aside = status.issues.filter((issue) => issue.set_aside);
   const worst = serious.some((issue) => issue.severity === "critical") ? "critical" : "warning";
 
   if (serious.length === 0) {
@@ -182,7 +194,11 @@ function render(status) {
   } else {
     nodes.mark.className = `verdict-mark is-${worst}`;
     nodes.line.textContent = `${serious.length} thing${serious.length === 1 ? "" : "s"} need${serious.length === 1 ? "s" : ""} attention`;
-    nodes.detail.textContent = "Each one below says what it is and what you can do about it.";
+    const fresh = status.new_issues || 0;
+    nodes.detail.textContent =
+      fresh === 0
+        ? "None of them is new: earlier scans reported each one. Each says what it is and what you can do."
+        : `${fresh === serious.length ? "All" : fresh} new since the last scan. Each one below says what it is and what you can do about it.`;
   }
 
   const parts = [];
@@ -195,14 +211,34 @@ function render(status) {
   clear(nodes.issues);
   if (status.issues.length === 0) return;
 
-  for (const issue of status.issues) {
+  for (const issue of status.issues.filter((i) => !i.set_aside)) {
     nodes.issues.append(renderIssue(issue));
+  }
+
+  // Still there, still counted in the history, never in the verdict.
+  if (aside.length > 0) {
+    const group = el("details", "aside-group");
+    group.append(el("summary", null, `Set aside (${aside.length})`));
+    for (const issue of aside) group.append(renderIssue(issue));
+    nodes.issues.append(group);
   }
 }
 
+/** "New", or how long it has been reported. */
+function history(issue) {
+  if (!issue.times_seen) return null;
+  if (issue.times_seen <= 1) return el("span", "badge is-new", "new");
+  const age = Date.now() / 1000 - issue.first_seen;
+  const since = age < 86400 ? `first ${timeAgo(issue.first_seen)}` : `since ${new Date(issue.first_seen * 1000).toLocaleDateString()}`;
+  return el("span", "badge", `seen in ${issue.times_seen} scans, ${since}`);
+}
+
 function renderIssue(issue) {
-  const card = el("div", `issue is-${issue.severity}`);
-  card.append(el("div", "issue-title", issue.title));
+  const card = el("div", `issue is-${issue.severity}${issue.set_aside ? " is-aside" : ""}`);
+  const title = el("div", "issue-title", issue.title);
+  const seen = history(issue);
+  if (seen) title.append(seen);
+  card.append(title);
   card.append(el("div", "issue-location", issue.location));
   if (issue.detail) card.append(el("div", "issue-detail", issue.detail));
 
@@ -210,14 +246,36 @@ function renderIssue(issue) {
   const result = el("div", "issue-result");
   result.hidden = true;
 
-  for (const action of issue.actions) {
+  const offered = issue.set_aside
+    ? [{ id: "bring_back", label: "Bring back", destructive: false }]
+    : issue.actions;
+  for (const action of offered) {
     actions.append(
       button(action.label, () => act(issue, action, card, result, actions), action.destructive ? "danger" : "")
     );
   }
+  if (issue.kind !== "module_unavailable") {
+    actions.append(button("Save as evidence…", () => saveEvidence(issue)));
+  }
 
   card.append(actions, result);
   return card;
+}
+
+async function saveEvidence(issue) {
+  const path = await askWhereToSave(
+    dialog,
+    "Save the evidence",
+    `grt-sentry-evidence-${dateStamp()}.zip`,
+    "zip",
+    "ZIP archive"
+  );
+  if (!path) return;
+  try {
+    toast(await api.exportEvidence(issue.id, path));
+  } catch (error) {
+    toast(errorText(error), true);
+  }
 }
 
 async function act(issue, action, card, result, actions) {
@@ -233,11 +291,6 @@ async function act(issue, action, card, result, actions) {
 
   try {
     const message = await api.resolveIssue(issue.id, action.id, null);
-
-    if (action.id === "ignore") {
-      card.remove();
-      return;
-    }
 
     // "Show the whole list" answers in place and resolves nothing.
     if (action.id === "list_packages") {

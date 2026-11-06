@@ -84,9 +84,9 @@ impl Action {
         Self { id: id.to_string(), label: label.to_string(), destructive }
     }
 
-    /// Drops an issue from this scan's list without recording anything.
+    /// Moves an issue out of the way until it changes.
     pub fn ignore() -> Self {
-        Action::new("ignore", "Ignore", false)
+        Action::new("ignore", "Set aside", false)
     }
 }
 
@@ -103,6 +103,29 @@ pub struct Issue {
     /// The longer explanation shown under the title.
     pub detail: Option<String>,
     pub actions: Vec<Action>,
+    /// What stays the same about this problem from one scan to the next.
+    #[serde(skip)]
+    pub fingerprint: String,
+    /// When a scan first reported it, and how many scans have.
+    #[serde(default)]
+    pub first_seen: i64,
+    #[serde(default)]
+    pub times_seen: u32,
+    /// Set aside by the user: still listed, never counted.
+    #[serde(default)]
+    pub set_aside: bool,
+}
+
+impl Issue {
+    /// Above information and not set aside.
+    pub fn counts(&self) -> bool {
+        self.severity != Severity::Info && !self.set_aside
+    }
+
+    /// Counts, and no earlier scan reported it.
+    pub fn is_new(&self) -> bool {
+        self.counts() && self.times_seen <= 1
+    }
 }
 
 impl Default for Issue {
@@ -115,6 +138,10 @@ impl Default for Issue {
             location: String::new(),
             detail: None,
             actions: vec![],
+            fingerprint: String::new(),
+            first_seen: 0,
+            times_seen: 0,
+            set_aside: false,
         }
     }
 }
@@ -131,7 +158,9 @@ pub enum IssueTarget {
     Baseline { kind: String, key: String, value: String },
     Autostart { key: String, name: String },
     Packages { names: Vec<String> },
-    LoginAttempts { ip: String },
+    LoginAttempts { ip: String, failures: u32 },
+    /// Addresses the automatic response offers to block in one go.
+    BlockProposal { ips: Vec<String> },
     /// Nothing to act on.
     Informational,
 }
@@ -168,6 +197,12 @@ pub struct SystemStatus {
     /// Files hashed but still waiting for a VirusTotal answer.
     pub queued_files: u32,
     pub issues: Vec<Issue>,
+    /// Issues that count and that no earlier scan reported.
+    #[serde(default)]
+    pub new_issues: u32,
+    /// The row in the scan history, 0 before it is recorded.
+    #[serde(default)]
+    pub scan_id: i64,
 }
 
 impl Default for SystemStatus {
@@ -179,18 +214,21 @@ impl Default for SystemStatus {
             active_connections: 0,
             queued_files: 0,
             issues: vec![],
+            new_issues: 0,
+            scan_id: 0,
         }
     }
 }
 
 impl SystemStatus {
-    /// Sorts by severity, worst first, and recomputes `clean`.
+    /// Sorts worst first with what was set aside last, and recomputes the counts.
     ///
     /// The sort is stable, so issues of equal severity keep the order the
     /// modules produced them in.
     pub fn finish(&mut self) {
-        self.issues.sort_by_key(|issue| std::cmp::Reverse(issue.severity));
-        self.clean = !self.issues.iter().any(|i| i.severity != Severity::Info);
+        self.issues.sort_by_key(|issue| (issue.set_aside, std::cmp::Reverse(issue.severity)));
+        self.clean = !self.issues.iter().any(Issue::counts);
+        self.new_issues = self.issues.iter().filter(|i| i.is_new()).count() as u32;
     }
 }
 
@@ -267,6 +305,27 @@ mod tests {
         let mut only_info = SystemStatus { issues: vec![issue(Severity::Info)], ..Default::default() };
         only_info.finish();
         assert!(only_info.clean);
+    }
+
+    #[test]
+    fn what_was_set_aside_goes_last_and_leaves_the_machine_clean() {
+        let mut status = SystemStatus {
+            issues: vec![
+                Issue { severity: Severity::Critical, set_aside: true, times_seen: 4, ..Default::default() },
+                Issue { severity: Severity::Info, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        status.finish();
+        assert!(status.clean);
+        assert_eq!(status.new_issues, 0);
+        assert!(status.issues[1].set_aside);
+
+        status.issues.push(Issue { severity: Severity::Warning, times_seen: 1, ..Default::default() });
+        status.issues.push(Issue { severity: Severity::Warning, times_seen: 3, ..Default::default() });
+        status.finish();
+        assert!(!status.clean);
+        assert_eq!(status.new_issues, 1, "seen before is not new");
     }
 
     #[test]

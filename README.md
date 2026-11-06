@@ -11,6 +11,9 @@ found, and offers something to do about each thing.
   archives are opened and judged too. VirusTotal adds its engines when given a
   key; nothing depends on it.
 - **On demand.** Nothing runs in the background unless it is switched on.
+- **It remembers.** Every problem carries its history: new in this scan, seen
+  in the last five, or set aside. What was set aside stays aside until it
+  changes, and a notification comes only for something new.
 - **Reversible.** Quarantine before deletion, an undo log, and a firewall it
   drives rather than replaces.
 - **Small.** Built for machines with under 4 GB of memory: no framework, no
@@ -89,7 +92,8 @@ reported.
 system cron, the scripts in `/etc/cron.*`, the modules loaded at boot, and each
 line of the files a shell reads when it starts. Recorded the first time each
 place is read, and afterwards only what is new is reported. A list of forty
-legitimate entries says nothing; "this one was not here yesterday" says a lot.
+legitimate entries says nothing; "this one was not here yesterday" says a lot,
+and it stays on the list until it is marked Expected or set aside.
 A new line in `.bashrc` is information unless the rules see something in it.
 
 **Logins and accounts.** Counts authentication failures per address in the
@@ -97,6 +101,12 @@ last 24 hours, from `/var/log/auth.log` or from the journal, and offers to
 block the ones that are clearly knocking. A second account with user ID 0, a
 new account that can log in, a user who starts using sudo, and an SSH login at
 an hour when the machine has never seen one are each reported.
+
+The automatic response, off until it is switched on in Settings, gathers every
+address past a number of failures into one card with one button that blocks
+them all for 24 hours, with one password. A scan run as root blocks them
+without asking. Either way each block is in the action log and can be lifted
+sooner, and an address that is blocked is not offered again.
 
 **Browser extensions.** Firefox and the Chromium family, including the snap
 and flatpak builds. An extension that did not come from the store, loaded
@@ -132,6 +142,11 @@ takes hashes, file names, paths and IP addresses, one per line, with a note
 after the first space; a match on a file, a running program or a connection is
 critical. Both change only when you edit them.
 
+**A saved capture.** GRT Sentry never captures traffic, but it reads a `.pcap`
+or `.pcapng` that tcpdump or Wireshark recorded: who talked to whom, on which
+port, how much. Every address is compared with your indicators, and a match
+joins the Status list like any other problem. Only headers are read.
+
 **Packaged programs.** dpkg keeps an MD5 of every file it installs and rpm a
 SHA-256. Each program in `bin` and `sbin`, and each PAM module, which decides
 who may log in, is compared with that record. A replaced system program is found
@@ -150,6 +165,7 @@ and in two places the answer is narrower on Windows.
 | Open connections | `/proc/net` | the Win32 socket table, **TCP only** |
 | Close one connection | `ss --kill` | `SetTcpEntry`, **IPv4 TCP only** |
 | Block an address | an nftables set | a Defender Firewall rule |
+| Block for 24 hours | an nftables set whose elements time out | a firewall rule the first elevated scan after the day removes |
 | Stop a process | SIGTERM | `taskkill` |
 | Failed logins | `/var/log/auth.log` | Security event log, event 4625 |
 | Startup entries | desktop files, user units, cron | Run keys, Startup folder, scheduled tasks |
@@ -161,6 +177,7 @@ and in two places the answer is narrower on Windows.
 | Privileged files, system folders, SSH, sudo, PATH | checked | **not checked** |
 | Browser extensions | Firefox, Chrome, Chromium, Brave, Edge, Vivaldi | the same |
 | Scheduled scan | systemd user timer | Task Scheduler |
+| Notifications | `notify-send` | a toast, under GRT Sentry's name when installed |
 | Administrator rights | `pkexec`, asked for per action | the whole program runs elevated, or not |
 
 Windows has no per-command authentication dialog, so blocking an address,
@@ -183,34 +200,48 @@ reports almost nothing: it is establishing what normal looks like. From the
 second scan onwards it reports what changed.
 
 **The Status tab** is the answer. Green means nothing above information was
-found. Otherwise every problem is a card: what it is, where it is, and a row of
-buttons. Destructive buttons ask for confirmation.
+found. Otherwise every problem is a card: what it is, where it is, whether it
+is new or how many scans have reported it, and a row of buttons. Destructive
+buttons ask for confirmation.
 
 | Problem | What is offered |
 |---|---|
-| A file engines flag | Quarantine, Delete, Trust this file, Ignore |
-| A file a rule matches, or an archive with one inside | Quarantine, Delete, Trust this file, Ignore |
-| An archive a limit or a password kept from view | Quarantine, Delete, Trust this file, Ignore |
-| A file nobody has seen | Send for analysis, Trust this file, Ignore |
-| A connection | Close connection, Stop process, Block address, Trust, Ignore |
-| Failed logins from an address | Block address, Expected, Ignore |
-| A changed system file | This was expected, Ignore |
-| A system program that differs from its package | This was expected, Ignore |
-| A process running from somewhere odd | Stop process, Ignore |
-| A new kernel module, extension, account or privileged file | Expected, Ignore |
-| A changed file in a watched system folder | This was expected, Ignore |
-| Unreadable sudo rules | Read with administrator rights, Ignore |
-| Pending updates | Show the whole list, Ignore |
-| A new startup entry | Expected, Ignore |
+| A file engines flag | Quarantine, Delete, Trust this file, Set aside |
+| A file a rule matches, or an archive with one inside | Quarantine, Delete, Trust this file, Set aside |
+| An archive a limit or a password kept from view | Quarantine, Delete, Trust this file, Set aside |
+| A file nobody has seen | Send for analysis, Trust this file, Set aside |
+| A connection | Close connection, Stop process, Block address, Trust, Set aside |
+| Failed logins from an address | Block address, Expected, Set aside |
+| Addresses past the automatic response's limit | Block for 24 hours, Set aside |
+| A changed system file | This was expected, Set aside |
+| A system program that differs from its package | This was expected, Set aside |
+| A process running from somewhere odd | Stop process, Set aside |
+| A new kernel module, extension, account or privileged file | Expected, Set aside |
+| A changed file in a watched system folder | This was expected, Set aside |
+| Unreadable sudo rules | Read with administrator rights, Set aside |
+| Pending updates | Show the whole list, Set aside |
+| A new startup entry | Expected, Set aside |
 
-**Ignore** drops a card from this scan and records nothing. **Trust** is the
-permanent version: a trusted file stops being reported until its contents
-change, and a trusted address stops being reported at all.
+**Set aside** moves a card to a folded list at the bottom. It no longer counts
+towards the verdict, and later scans keep it there for as long as it stays the
+same: a file until its contents change, an address, a startup entry or a
+setting until it is a different one. *Bring back* undoes it. **Trust** is
+stronger: a trusted file or address stops being reported at all.
+
+**Save as evidence** on any card writes a zip with what was found, what GRT
+Sentry did about it, the log lines that mention it and the files it is about.
+The files go in encrypted with the password `infected`, the usual convention
+for passing samples on, so no antivirus deletes the archive on the way and
+nobody opens a sample by mistake. Every entry carries the same date and
+permissions, so the archive says nothing about the machine beyond what is in
+it.
 
 **The Connections tab** is the full list of open sockets, with the process that
 owns each one and where the remote address is announced from. *Close* ends one
 connection; *Trust* stops that address being reported. The filter box matches
-process names, addresses and places.
+process names, addresses and places. *Read a capture* opens a saved `.pcap` or
+`.pcapng` and lists its conversations, biggest first, with any address from
+your indicators at the top.
 
 An unwanted connection has three answers, in increasing order of force:
 
@@ -222,18 +253,28 @@ An unwanted connection has three answers, in increasing order of force:
 
 **The Quarantine tab** holds the files that were moved out of the way, the log
 of everything GRT Sentry has done, and the lists of trusted files and trusted
-addresses. *Put back* restores a file to its original path, contents and
-permissions. *Undo* on a log line reverses a block or a quarantine. Nothing
-here deletes anything until *Delete for good* is pressed.
+addresses. *Look inside* reads a quarantined file without running it: what the
+bytes say it is, and whether its name pretends otherwise, its SHA-256 and MD5,
+its entropy, the readable strings with addresses and commands picked out, and
+the rules it matches. *Save as evidence* writes the same zip as on a card.
+*Put back* restores a file to its original path, contents and permissions.
+*Undo* on a log line reverses a block or a quarantine. Nothing here deletes
+anything until *Delete for good* is pressed.
+
+**The History tab** lists past scans. Each one opens as a report, plain text to
+read, print or send, and *What changed* compares it with the scan before:
+what appeared and what went. The latest hundred scans keep everything they
+found.
 
 **The Settings tab** holds the API key, the folders to scan and to skip, the
 thresholds, the package check and the scheduled scan. At the bottom it lists where everything lives and whether
 the optional pieces are present.
 
 **A scheduled scan** runs the same checks without a window and notifies only
-when something needs attention. Turn it on in Settings.
+when something new needs attention: what it already said yesterday stays
+quiet. Turn it on in Settings.
 
-Keyboard: Ctrl+1 to Ctrl+4 change tab.
+Keyboard: Ctrl+1 to Ctrl+5 change tab.
 
 ## The command line
 
@@ -241,12 +282,15 @@ Keyboard: Ctrl+1 to Ctrl+4 change tab.
 grt-sentry                 open the window
 grt-sentry --scan          run a scan without a window and print the result
 grt-sentry --status        print the result of the last scan
+grt-sentry --report        print the last scan in full, to save or send
+grt-sentry --compare       print what changed between the last two scans
 grt-sentry --connections   list the active network connections
 grt-sentry --where         print where the data, configuration and quarantine live
 ```
 
 `--scan` exits 0 when nothing above information was found and 1 when something
-was, so it fits into a script. It is also what the scheduled scan runs.
+was, so it fits into a script; what was set aside does not count. It is also
+what the scheduled scan runs.
 
 ## Where things are
 
@@ -287,7 +331,7 @@ during a scan and nothing else.
 cd src-tauri && cargo test
 ```
 
-222 tests. Among them: with no key and no network, EICAR is found on its own
+253 tests. Among them: with no key and no network, EICAR is found on its own
 and inside a zip; a zip, a gzip and a tar.gz bomb are each stopped and named,
 and an honest log file that compresses well is not; a replaced program in a fake
 dpkg tree is found and an untouched one is not; every rule has a sample it must
@@ -300,7 +344,13 @@ where every module is unavailable still produces a result; a module that hides
 from /proc/modules, a second root account, a sudo rule without a password, a
 command linked into /tmp, a Firefox extension sideloaded by another program and
 a `.bashrc` line that opens a reverse shell are each found, and an update that
-ships a new version of a PAM file is not reported. No malware sample is
+ships a new version of a PAM file is not reported; EICAR set aside in one scan
+is still aside in the next and not called new, while the same file with new
+contents is; a notification comes only for something new; an evidence archive
+opens without a password except for its samples, and holds no real date; a
+pcap and a pcapng of the same packets give the same conversations; and
+failed logins from a trusted address or from the local network are never
+offered for blocking. No malware sample is
 stored anywhere: EICAR is built at run time, and the rest are a line or two of
 text.
 
@@ -311,7 +361,9 @@ text.
 Runs the rules and the archive reader over every file under `/usr`, `/etc` and
 `/opt` and counts what they would report, then every system check twice on the
 machine it runs on. The budget for a clean machine is zero in both, and the
-first half is checked on every push. On a desktop Debian install:
+first half is checked on every push. The second scan may not report anything
+new either, pending updates and failed logins included: those describe the
+machine's real life, and the history already knows them. On a desktop Debian install:
 190,000 files, 9 GB and 177,000 archive members in 83 seconds, no alarms, and
 171 MB of memory at the peak.
 
@@ -325,8 +377,11 @@ alarm. Then it plants 25 samples, among them a replaced `whoami`, a
 set-user-ID shell in `/tmp`, a cron job and a systemd unit, a second root
 account, a sudo rule without a password, a process run from a deleted file,
 and a library in `/etc/ld.so.preload` that hides a process from every listing
-of `/proc`. All 25 must be named. Last run: 25 of 25, no alarm on the clean
-image, the profile in enforce and no AppArmor denial.
+of `/proc`. All 25 must be named. A last root scan with the automatic response
+on must call none of them new, and must block for a day an address that keeps
+failing to log in. Last run: 25 of 25, no alarm on the clean image, none of the
+22 alarms called new the second time, the address blocked for a day, the
+profile in enforce and no AppArmor denial.
 
 ```bash
 ./scripts/check-weight.sh
@@ -365,7 +420,15 @@ To look at the interface without building anything:
 - The geolocation says where the network announcing an address is registered.
   That is a data centre or a provider, not a person and not a street.
 - Blocking an address stops this machine reaching it. It is an outbound rule,
-  not an inbound firewall.
+  not an inbound firewall; for a stranger knocking on SSH that is enough, since
+  no answer gets back.
+- The blocks that last 24 hours need `scripts/setup-nftables.sh` run again on
+  a table made before 0.4, which adds the two sets that time out. On Windows a
+  firewall rule cannot expire, so the first scan run as administrator after the
+  day removes it.
+- The password on an evidence archive is a convention, not protection: anyone
+  who knows it can open the files, and the archive's encryption is the old zip
+  kind every tool can read.
 - On Windows the connections list is TCP only, and only IPv4 TCP connections
   can be closed. Windows exposes no peer for a UDP association and no call that
   ends an IPv6 connection.

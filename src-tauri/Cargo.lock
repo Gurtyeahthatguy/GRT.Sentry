@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "grt-sentry"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -1709,6 +1709,7 @@ dependencies = [
  "toml 0.8.2",
  "uuid",
  "walkdir",
+ "windows",
  "windows-sys 0.59.0",
  "yara-x",
  "zip",

@@ -1,6 +1,6 @@
 [package]
 name = "grt-sentry"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local security scanner: checks files, connections and system state on demand"
 authors = ["GRT Project"]
 license = "MIT"
@@ -73,6 +73,11 @@ features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Threading",
 ]
+
+# Toasts, through the same crate Tauri already builds on Windows.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.61"
+features = ["Data_Xml_Dom", "UI_Notifications"]
 
 [dev-dependencies]
 tempfile = "3"

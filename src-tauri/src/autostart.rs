@@ -63,19 +63,22 @@ pub fn findings_for(conn: &Connection, entries: &[AutostartEntry], sources: &[&s
     let mut recorded = 0usize;
 
     for entry in entries {
-        let known = db::autostart_is_known(conn, &entry.key);
-        if !known {
-            let _ = db::remember_autostart(conn, &entry.key, &entry.source, &entry.name, &entry.command);
-        }
-        if known {
+        if db::autostart_is_known(conn, &entry.key) {
             continue;
         }
+        let remember = || db::remember_autostart(conn, &entry.key, &entry.source, &entry.name, &entry.command);
         if !started.contains(&entry.source.as_str()) {
+            let _ = remember();
             recorded += 1;
             continue;
         }
 
+        // A warning stays until it is accepted or set aside; information is
+        // said once.
         let (severity, why) = severity_of(entry);
+        if severity == Severity::Info {
+            let _ = remember();
+        }
         findings.push(Finding::new(
             Issue {
                 kind: IssueKind::UnknownAutostartEntry,
@@ -173,6 +176,20 @@ mod tests {
 
     fn entry(source: &str, key: &str, command: &str) -> AutostartEntry {
         AutostartEntry { key: key.into(), source: source.into(), name: key.into(), command: command.into() }
+    }
+
+    #[test]
+    fn a_new_entry_is_reported_until_it_is_accepted() {
+        let conn = crate::db::open_memory();
+        let sources = ["system service"];
+        findings_for(&conn, &[], &sources);
+
+        let later = [entry("system service", "system service:evil.service", "systemctl status evil.service")];
+        assert_eq!(findings_for(&conn, &later, &sources).len(), 1);
+        assert_eq!(findings_for(&conn, &later, &sources).len(), 1, "the second scan still reports it");
+
+        accept(&conn, "system service:evil.service", "evil.service").unwrap();
+        assert!(findings_for(&conn, &later, &sources).is_empty());
     }
 
     #[test]

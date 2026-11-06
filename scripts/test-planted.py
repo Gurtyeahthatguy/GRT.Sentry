@@ -8,6 +8,8 @@ Boots a Debian live image under QEMU with no network, installs the package,
 and scans twice as the live user and twice as root on the untouched system:
 the second scans must raise no alarm. Then it plants one sample of each thing
 Sentry looks for, scans again both ways, and checks every sample was named.
+A last root scan, with the automatic response on, must call none of it new and
+must block the address that keeps failing to log in.
 
 The samples are synthetic: EICAR built from its bytes, a few lines of shell,
 copies of system programs with bits set, a test library that hides one
@@ -116,6 +118,15 @@ say "GRT-HIDER $(ls /proc | grep -c '^[0-9]') listed, ps sees $(ps -e | grep -c 
 
 scan grt USER-PLANTED
 scan root ROOT-PLANTED
+
+# --- 0.4: the same things again are not news, and the automatic response ---
+bash /run/p/setup-nftables.sh >/dev/null 2>&1; say "GRT-NFT-SETUP $?"
+for i in $(seq 1 12); do logger -p auth.info -t sshd "Failed password for root from 185.220.101.7 port 22 ssh2"; done
+sed -i 's/^auto_block = false/auto_block = true/' /root/.config/grt-sentry/config.toml
+scan root ROOT-AGAIN
+say "GRT-AUTOBLOCK $(nft list set inet grtsentry autoblock 2>&1 | tr '\n' ' ')"
+(cd /root && HOME=/root grt-sentry --report) | grep -A3 'automatic block did not work' | sed 's/^/GRT-WHY /' >$S
+say "GRT-COMPARE $(cd /root && HOME=/root grt-sentry --compare 2>&1 | sed -n 3p)"
 dmesg | grep 'apparmor="DENIED"' | grep grt-sentry | sed -E 's/.*operation="([^"]*)".*name="([^"]*)".*requested_mask="([^"]*)".*/\1 \2 \3/' | sort | uniq -c | sed 's/^ */GRT-DENIED /' >$S
 say GRT-DONE
 """
@@ -199,6 +210,7 @@ def main():
         (payload / "eicar.com").write_text(EICAR_REVERSED[::-1])
         (payload / "extensions.json").write_text(EXTENSIONS)
         shutil.copy(deb, payload / "grt-sentry.deb")
+        shutil.copy(root / "scripts" / "setup-nftables.sh", payload / "setup-nftables.sh")
         (work / "hider.c").write_text(HIDER)
         subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-o", str(payload / "hider.so"), str(work / "hider.c"), "-ldl"],
                        check=True)
@@ -261,6 +273,30 @@ def main():
         missed += not seen
     print(f"planted: {len(EXPECTED) - missed} of {len(EXPECTED)} found")
     ok &= missed == 0
+
+    # Everything planted is still there in the second root scan, and none of
+    # it may be announced as new: that is what the history is for.
+    again = alarms(text, "ROOT-AGAIN")
+    renewed = [a for a in again if a.endswith("(new)")]
+    print(f"second planted scan: {len(again)} alarms, {len(renewed)} announced as new")
+    for a in renewed:
+        print(f"   {a}")
+    ok &= bool(again) and not renewed
+
+    setup = re.search(r"GRT-NFT-SETUP (\d+)", text)
+    blocked = re.search(r"GRT-AUTOBLOCK (.*)", text)
+    noted = any("failed login attempts from 185.220.101.7, blocked" in t for t in titles(text, "ROOT-AGAIN"))
+    auto_ok = bool(setup and setup.group(1) == "0" and blocked and "185.220.101.7" in blocked.group(1) and noted)
+    print(f"automatic block as root: {'ok' if auto_ok else 'FAILED'}")
+    if not auto_ok and blocked:
+        print(f"   {blocked.group(1).strip()[:300]}")
+    for why in re.findall(r"GRT-WHY (.*)", text):
+        print(f"   {why.strip()}")
+    ok &= auto_ok
+
+    compare = re.search(r"GRT-COMPARE (.*)", text)
+    print(f"--compare: {compare.group(1).strip() if compare else 'nothing'}")
+    ok &= bool(compare and " appeared, " in compare.group(1))
 
     denied = re.findall(r"GRT-DENIED (.*)", text)
     print(f"AppArmor denials for grt-sentry: {len(denied)}")

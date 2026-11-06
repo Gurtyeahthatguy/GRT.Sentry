@@ -180,6 +180,21 @@ pub fn list(conn: &Connection) -> Result<Vec<QuarantineEntry>, String> {
     db::list_quarantine(conn)
 }
 
+/// Lets `read` see a quarantined file, and seals it again afterwards.
+///
+/// Nothing here executes it: the permissions go from none to read and write
+/// for the owner, and back.
+pub fn with_readable<T>(entry: &QuarantineEntry, read: impl FnOnce(&Path) -> T) -> Result<T, String> {
+    let path = PathBuf::from(&entry.quarantine_path);
+    if !path.is_file() {
+        return Err(format!("The quarantined file is missing from {}", entry.quarantine_path));
+    }
+    platform::unseal(&path).map_err(|e| format!("Cannot open the quarantined file: {e}"))?;
+    let result = read(&path);
+    platform::seal(&path).map_err(|e| format!("Cannot seal the quarantined file again: {e}"))?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +308,27 @@ mod tests {
         assert!(!stored.exists());
         assert!(db::get_quarantine(&conn, &id).unwrap().is_none());
         assert!(list(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reading_a_quarantined_file_leaves_it_sealed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = testenv::isolated_data_dir(&tmp.path().join("data"));
+        let victim = tmp.path().join("x.run");
+        fs::write(&victim, b"inside").unwrap();
+
+        let conn = crate::db::open_memory();
+        let id = quarantine_file(&conn, victim.to_str().unwrap(), "test").unwrap();
+        let entry = db::get_quarantine(&conn, &id).unwrap().unwrap();
+
+        let bytes = with_readable(&entry, |path| fs::read(path).unwrap()).unwrap();
+        assert_eq!(bytes, b"inside");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&entry.quarantine_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0, "sealed again after reading");
+        }
     }
 
     #[test]

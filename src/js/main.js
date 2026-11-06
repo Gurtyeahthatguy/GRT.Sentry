@@ -4,6 +4,7 @@ import { api } from "./api.js";
 import { initStatus, refreshStatus } from "./status.js";
 import { initConnections, load as loadConnections } from "./connections.js";
 import { load as loadQuarantine } from "./quarantine.js";
+import { load as loadHistory } from "./history.js";
 import { initSettings, load as loadSettings } from "./settings.js";
 import { errorText, toast } from "./ui.js";
 
@@ -11,6 +12,7 @@ const loaders = {
   status: refreshStatus,
   connections: loadConnections,
   quarantine: loadQuarantine,
+  history: loadHistory,
   settings: loadSettings,
 };
 
@@ -40,13 +42,14 @@ function initTabs() {
     if (tab) selectTab(tab.dataset.tab);
   });
 
-  // Ctrl+1 to Ctrl+4 change tab.
+  // Ctrl+1 to Ctrl+5 change tab.
+  const order = ["status", "connections", "quarantine", "history", "settings"];
   window.addEventListener("keydown", (event) => {
     if (!event.ctrlKey || event.shiftKey || event.altKey) return;
-    const index = ["1", "2", "3", "4"].indexOf(event.key);
+    const index = ["1", "2", "3", "4", "5"].indexOf(event.key);
     if (index === -1) return;
     event.preventDefault();
-    selectTab(["status", "connections", "quarantine", "settings"][index]);
+    selectTab(order[index]);
   });
 }
 

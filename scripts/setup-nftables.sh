@@ -4,9 +4,10 @@
 #
 #   sudo ./scripts/setup-nftables.sh
 #
-# It is an ordinary table with two empty sets and a rule that drops traffic to
-# whatever is in them. Blocking an address adds one element to a set; no rule
-# is ever written by the program.
+# It is an ordinary table with four empty sets and rules that drop traffic to
+# whatever is in them; two of the sets let each address go after a day.
+# Blocking an address adds one element to a set; no rule is ever written by
+# the program. Running it again on an existing table only adds what is missing.
 #
 # To see what is blocked:  sudo nft list table inet grtsentry
 # To unblock one address:  sudo nft delete element inet grtsentry blacklist '{ 1.2.3.4 }'
@@ -34,6 +35,10 @@ nft add set inet grtsentry blacklist6 '{ type ipv6_addr; flags interval; comment
 
 # The output hook stops this machine reaching the address. It is not an
 # inbound firewall.
+# The automatic response puts addresses here, and each one lifts after a day.
+nft add set inet grtsentry autoblock  '{ type ipv4_addr; flags timeout; timeout 24h; comment "blocked for a day by GRT Sentry"; }'
+nft add set inet grtsentry autoblock6 '{ type ipv6_addr; flags timeout; timeout 24h; comment "blocked for a day by GRT Sentry"; }'
+
 nft add chain inet grtsentry output '{ type filter hook output priority 0; policy accept; }'
 
 # Added only if not already there, since 'add rule' would append a duplicate.
@@ -42,6 +47,12 @@ if ! nft list chain inet grtsentry output | grep -q '@blacklist '; then
 fi
 if ! nft list chain inet grtsentry output | grep -q '@blacklist6'; then
   nft add rule inet grtsentry output ip6 daddr @blacklist6 drop
+fi
+if ! nft list chain inet grtsentry output | grep -q '@autoblock '; then
+  nft add rule inet grtsentry output ip daddr @autoblock drop
+fi
+if ! nft list chain inet grtsentry output | grep -q '@autoblock6'; then
+  nft add rule inet grtsentry output ip6 daddr @autoblock6 drop
 fi
 
 echo

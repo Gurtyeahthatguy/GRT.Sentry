@@ -13,8 +13,8 @@ use crate::state::{
     Action, AppState, Finding, Issue, IssueKind, IssueTarget, Severity, Snapshot, SystemStatus,
 };
 use crate::{
-    accounts, audit, authlog, autostart, db, extensions, folders, indicators, integrity, netmon, packages, platform,
-    privilege, processes, rootkit, scanner, updates,
+    accounts, actionlog, audit, authlog, autostart, db, extensions, folders, history, indicators, integrity, netmon,
+    packages, platform, privilege, processes, response, rootkit, scanner, updates,
 };
 
 fn phase(name: &str, message: &str) -> scanner::ScanProgress {
@@ -52,6 +52,10 @@ pub async fn scan(
     let mut findings: Vec<Finding> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let own_indicators = indicators::Indicators::load();
+    {
+        let conn = state.db.lock().unwrap();
+        response::lift_expired(&conn, db::now());
+    }
 
     // 1. Files, the slow module and the only one that uses the network.
     let outcome = scanner::run_scan(
@@ -128,7 +132,12 @@ pub async fn scan(
             total: 0,
             message: "Checking failed logins".into(),
         });
-        findings.extend(authlog::findings(&conn, &config.auth_log_path, config.failed_login_threshold));
+        let mut logins = authlog::findings(&conn, &config.auth_log_path, config.failed_login_threshold);
+        response::mark_blocked(&conn, &mut logins, db::now());
+        if config.auto_block {
+            response::respond(&conn, &mut logins, config.auto_block_after, db::now());
+        }
+        findings.extend(logins);
 
         progress(scanner::ScanProgress {
             phase: "integrity".into(),
@@ -204,8 +213,13 @@ pub async fn scan(
         files_checked,
         active_connections,
         queued_files,
-        issues: Vec::new(),
+        ..Default::default()
     };
+
+    {
+        let conn = state.db.lock().unwrap();
+        history::apply(&conn, &mut findings, status.last_scan);
+    }
 
     let mut snapshot = Snapshot::default();
     for finding in findings {
@@ -216,8 +230,17 @@ pub async fn scan(
 
     {
         let conn = state.db.lock().unwrap();
-        let real_issues = status.issues.iter().filter(|i| i.severity != Severity::Info).count();
-        let _ = db::record_scan(&conn, files_checked, real_issues);
+        let real_issues = status.issues.iter().filter(|i| i.counts()).count();
+        match db::record_scan(&conn, files_checked, real_issues) {
+            Ok(id) => {
+                status.scan_id = id;
+                let stored: Vec<_> = status.issues.iter().map(history::stored).collect();
+                if let Err(e) = db::record_scan_issues(&conn, id, &stored) {
+                    eprintln!("grt-sentry: the scan's issues could not be kept: {e}");
+                }
+            }
+            Err(e) => eprintln!("grt-sentry: the scan could not be recorded: {e}"),
+        }
     }
 
     snapshot.status = status.clone();
@@ -231,8 +254,70 @@ pub fn dismiss(state: &AppState, issue_id: &str) {
     let mut snapshot = state.snapshot.lock().unwrap();
     snapshot.status.issues.retain(|issue| issue.id != issue_id);
     snapshot.targets.remove(issue_id);
-    let clean = !snapshot.status.issues.iter().any(|i| i.severity != Severity::Info);
-    snapshot.status.clean = clean;
+    snapshot.status.finish();
+}
+
+/// Drops every issue whose target matches, after one action resolved them all.
+pub fn dismiss_where(state: &AppState, matches: impl Fn(&IssueTarget) -> bool) {
+    let mut snapshot = state.snapshot.lock().unwrap();
+    let gone: Vec<String> =
+        snapshot.targets.iter().filter(|(_, target)| matches(target)).map(|(id, _)| id.clone()).collect();
+    for id in &gone {
+        snapshot.targets.remove(id);
+    }
+    snapshot.status.issues.retain(|issue| !gone.contains(&issue.id));
+    snapshot.status.finish();
+}
+
+/// Sets an issue aside, or brings it back, in the snapshot and in the history.
+///
+/// Later scans keep it aside for as long as its fingerprint stays the same.
+pub fn set_aside(state: &AppState, issue_id: &str, aside: bool) -> Result<(), String> {
+    let mut snapshot = state.snapshot.lock().unwrap();
+    let issue = snapshot
+        .status
+        .issues
+        .iter_mut()
+        .find(|issue| issue.id == issue_id)
+        .ok_or_else(|| "That issue is not in the current results. Run a scan again.".to_string())?;
+    issue.set_aside = aside;
+    let (print, kind, title) = (issue.fingerprint.clone(), history::kind_name(issue), issue.title.clone());
+    snapshot.status.finish();
+    drop(snapshot);
+
+    if print.is_empty() {
+        return Ok(());
+    }
+    let conn = state.db.lock().unwrap();
+    db::set_issue_aside(&conn, &print, &kind, aside)?;
+    let what = if aside { actionlog::kind::SET_ASIDE } else { actionlog::kind::BRING_BACK };
+    actionlog::record(&conn, what, &title, None, false);
+    Ok(())
+}
+
+/// Puts findings that came after the scan, from a privileged read or a
+/// capture, into the current results.
+pub fn add_findings(state: &AppState, mut findings: Vec<Finding>) -> usize {
+    {
+        let conn = state.db.lock().unwrap();
+        history::apply(&conn, &mut findings, db::now());
+    }
+    let count = findings.len();
+    let mut snapshot = state.snapshot.lock().unwrap();
+    for finding in findings {
+        snapshot.targets.insert(finding.issue.id.clone(), finding.target);
+        snapshot.status.issues.push(finding.issue);
+    }
+    snapshot.status.finish();
+    count
+}
+
+/// An issue and its target, for exporting it.
+pub fn issue_of(state: &AppState, issue_id: &str) -> Option<(Issue, IssueTarget)> {
+    let snapshot = state.snapshot.lock().unwrap();
+    let issue = snapshot.status.issues.iter().find(|i| i.id == issue_id)?.clone();
+    let target = snapshot.targets.get(issue_id)?.clone();
+    Some((issue, target))
 }
 
 /// What an action refers to, if the snapshot still knows.
@@ -374,12 +459,37 @@ mod tests {
         assert!(current(&state).clean, "the last problem leaving makes the machine clean again");
     }
 
+    #[tokio::test]
+    async fn an_issue_set_aside_stays_aside_in_the_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("eicar.com"), crate::rules::samples::eicar()).unwrap();
+        let state = state_for(dir.path());
+
+        let first = scan(&state, None, &|_| {}).await.unwrap();
+        let eicar = first.issues.iter().find(|i| i.kind == IssueKind::RuleMatch).expect("EICAR is found");
+        assert!(eicar.is_new());
+        set_aside(&state, &eicar.id, true).unwrap();
+        assert!(current(&state).issues.iter().any(|i| i.set_aside));
+
+        let second = scan(&state, None, &|_| {}).await.unwrap();
+        let again = second.issues.iter().find(|i| i.kind == IssueKind::RuleMatch).unwrap();
+        assert!(again.set_aside, "set aside stays aside");
+        assert!(!again.is_new(), "and does not come back as new");
+        assert_eq!(again.times_seen, 2);
+        assert!(second.scan_id > first.scan_id);
+
+        let conn = state.db.lock().unwrap();
+        let stored = crate::db::scan_issues(&conn, second.scan_id).unwrap();
+        assert!(stored.iter().any(|i| i.set_aside && i.kind == "rule_match"));
+    }
+
     /// Run by scripts/check-false-positives.sh, not by `cargo test`.
     ///
     /// Every system check on this machine, twice: the first scan records,
-    /// and the second must find nothing to alarm about. Connections, pending
-    /// updates and failed logins describe the machine's real life and are
-    /// left out of the count.
+    /// and the second must find nothing to alarm about and nothing new.
+    /// Connections come and go between two scans and are left out of the
+    /// count; pending updates and failed logins are in it, and pass when the
+    /// history knows them already.
     #[tokio::test]
     #[ignore]
     async fn system_false_positive_budget() {
@@ -395,11 +505,12 @@ mod tests {
         let started = std::time::Instant::now();
         let status = scan(&state, None, &|_| {}).await.unwrap();
 
-        let excluded = [IssueKind::SuspiciousConnection, IssueKind::OutdatedSecurityPackage, IssueKind::FailedLoginAttempts];
+        let live = [IssueKind::SuspiciousConnection, IssueKind::OutdatedSecurityPackage, IssueKind::FailedLoginAttempts];
         let alarms: Vec<String> = status
             .issues
             .iter()
-            .filter(|i| i.severity != Severity::Info && !excluded.contains(&i.kind))
+            .filter(|i| i.counts() && (i.is_new() || !live.contains(&i.kind)))
+            .filter(|i| i.kind != IssueKind::SuspiciousConnection)
             .map(|i| format!("{:?} {}", i.kind, i.title))
             .collect();
         println!("second scan: {:.1} s, {} issues, {} alarms", started.elapsed().as_secs_f64(), status.issues.len(), alarms.len());

@@ -24,6 +24,10 @@ pub mod kind {
     pub const UPDATE_BASELINE: &str = "update_baseline";
     pub const UPLOAD_VT: &str = "upload_vt";
     pub const ACCEPT: &str = "accept";
+    pub const AUTO_BLOCK: &str = "auto_block";
+    pub const SET_ASIDE: &str = "set_aside";
+    pub const BRING_BACK: &str = "bring_back";
+    pub const EXPORT: &str = "export";
 }
 
 /// Writes one line.
@@ -65,6 +69,10 @@ pub fn describe(record: &ActionRecord) -> String {
         kind::UPDATE_BASELINE => "Updated the reference hash for",
         kind::UPLOAD_VT => "Sent for analysis",
         kind::ACCEPT => "Accepted as expected:",
+        kind::AUTO_BLOCK => "Blocked for a day",
+        kind::SET_ASIDE => "Set aside",
+        kind::BRING_BACK => "Brought back",
+        kind::EXPORT => "Exported",
         other => other,
     };
     format!("{what} {}", record.target)

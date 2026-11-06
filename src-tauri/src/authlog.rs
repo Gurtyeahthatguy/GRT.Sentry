@@ -179,6 +179,8 @@ pub fn findings(conn: &Connection, log_path: &str, threshold: u32) -> Vec<Findin
 
     let now = crate::db::now();
     let mut found = findings_from_text(&text, threshold, now);
+    // "Expected" on an address means it is not reported again.
+    found.retain(|f| !matches!(&f.target, IssueTarget::LoginAttempts { ip, .. } if crate::db::ip_trusted(conn, ip)));
     found.extend(crate::accounts::login_findings(conn, &text, now));
     found
 }
@@ -226,7 +228,7 @@ pub fn findings_from_text(text: &str, threshold: u32, now: i64) -> Vec<Finding> 
                 ],
                 ..Default::default()
             },
-            IssueTarget::LoginAttempts { ip: address },
+            IssueTarget::LoginAttempts { ip: address, failures: count },
         ));
     }
 

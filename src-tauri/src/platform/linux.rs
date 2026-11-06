@@ -326,21 +326,65 @@ const TABLE: &str = "grtsentry";
 pub fn block_address(ip: &IpAddr) -> Result<(), String> {
     let set = if ip.is_ipv4() { "blacklist" } else { "blacklist6" };
     let element = format!("{{ {ip} }}");
-    run_privileged("nft", &["add", "element", "inet", TABLE, set, &element]).map_err(explain_nft)?;
+    nft(&["add", "element", "inet", TABLE, set, &element]).map_err(explain_nft)?;
     Ok(())
 }
 
 pub fn unblock_address(ip: &IpAddr) -> Result<(), String> {
     let set = if ip.is_ipv4() { "blacklist" } else { "blacklist6" };
     let element = format!("{{ {ip} }}");
-    run_privileged("nft", &["delete", "element", "inet", TABLE, set, &element]).map_err(explain_nft)?;
+    nft(&["delete", "element", "inet", TABLE, set, &element]).map_err(explain_nft)?;
+    Ok(())
+}
+
+/// Root changes the firewall itself, under the profile's own rule for nft;
+/// anyone else asks through pkexec.
+fn nft(args: &[&str]) -> Result<String, String> {
+    if is_elevated() {
+        run_plain("nft", args)
+    } else {
+        run_privileged("nft", args)
+    }
+}
+
+/// nftables drops an element by itself when its timeout runs out.
+pub const BLOCKS_EXPIRE: bool = true;
+
+/// The set for one address family, IPv4 or IPv6, whose elements time out.
+fn timed_set(ip: &IpAddr) -> &'static str {
+    if ip.is_ipv4() { "autoblock" } else { "autoblock6" }
+}
+
+/// Blocks addresses for a number of hours, in one command and so one password.
+pub fn block_for(ips: &[IpAddr], hours: i64) -> Result<(), String> {
+    let mut args: Vec<String> = Vec::new();
+    for set in ["autoblock", "autoblock6"] {
+        let elements: Vec<String> =
+            ips.iter().filter(|ip| timed_set(ip) == set).map(|ip| format!("{ip} timeout {hours}h")).collect();
+        if elements.is_empty() {
+            continue;
+        }
+        if !args.is_empty() {
+            args.push(";".to_string());
+        }
+        args.extend(["add", "element", "inet", TABLE, set].map(String::from));
+        args.push(format!("{{ {} }}", elements.join(", ")));
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    nft(&refs).map_err(explain_nft)?;
+    Ok(())
+}
+
+pub fn unblock_for(ip: &IpAddr) -> Result<(), String> {
+    let element = format!("{{ {ip} }}");
+    nft(&["delete", "element", "inet", TABLE, timed_set(ip), &element]).map_err(explain_nft)?;
     Ok(())
 }
 
 fn explain_nft(error: String) -> String {
     if error.contains("No such file or directory") || error.contains("does not exist") {
         return format!(
-            "The firewall table this program uses does not exist yet. Run scripts/setup-nftables.sh once, with sudo, to create it. ({error})"
+            "The firewall table or set this program uses does not exist yet. Run scripts/setup-nftables.sh once, with sudo, to create it; a table made before 0.4 needs it again for the sets that lift after a day. ({error})"
         );
     }
     if error.contains("File exists") {
@@ -363,6 +407,11 @@ pub fn firewall_note() -> &'static str {
 /// that was reused between the scan and the button.
 pub fn process_name(pid: i32) -> Option<String> {
     fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|s| s.trim().to_string())
+}
+
+/// The program a process runs, readable even after its file was deleted.
+pub fn process_executable(pid: i32) -> PathBuf {
+    PathBuf::from(format!("/proc/{pid}/exe"))
 }
 
 pub fn process_exists(pid: i32) -> bool {

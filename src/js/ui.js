@@ -45,6 +45,18 @@ export function formatSize(bytes) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+/** "2026-11-06", for the names of saved files. */
+export function dateStamp(timestamp) {
+  const date = timestamp ? new Date(timestamp * 1000) : new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** Where to save something, asked once; null when the user cancels. */
+export function askWhereToSave(dialog, title, defaultPath, extension, label) {
+  return dialog.save({ title, defaultPath, filters: [{ name: label, extensions: [extension] }] });
+}
+
 /** Thousands separated, in the desktop's own convention. */
 export function formatCount(value) {
   return Number(value || 0).toLocaleString();

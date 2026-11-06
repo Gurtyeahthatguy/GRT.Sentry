@@ -23,6 +23,17 @@ export const api = {
   listQuarantine: () => invoke("list_quarantine"),
   restoreFromQuarantine: (id) => invoke("restore_from_quarantine", { id }),
   deleteFromQuarantine: (id) => invoke("delete_from_quarantine", { id }),
+  inspectQuarantined: (id) => invoke("inspect_quarantined", { id }),
+  exportQuarantineEvidence: (id, path) => invoke("export_quarantine_evidence", { id, path }),
+  exportEvidence: (issueId, path) => invoke("export_evidence", { issueId, path }),
+
+  listScans: (limit) => invoke("list_scans", { limit }),
+  scanReport: (scanId) => invoke("scan_report", { scanId }),
+  exportReport: (scanId, path) => invoke("export_report", { scanId, path }),
+  compareScans: (older, newer) => invoke("compare_scans", { older, newer }),
+  exportComparison: (older, newer, path) => invoke("export_comparison", { older, newer, path }),
+
+  readCapture: (path) => invoke("read_capture", { path }),
 
   trustIp: (ip, label) => invoke("trust_ip", { ip, label }),
   untrustIp: (ip) => invoke("untrust_ip", { ip }),

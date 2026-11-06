@@ -22,17 +22,23 @@ mod dashboard;
 mod extensions;
 mod folders;
 mod db;
+mod evidence;
 mod geoip;
+mod history;
 mod indicators;
+mod inspect;
 mod integrity;
 mod netmon;
 mod packages;
 mod paths;
+mod pcap;
 mod platform;
 mod privilege;
 mod processes;
 mod quarantine;
+mod report;
 mod resolve;
+mod response;
 mod rootkit;
 mod rules;
 mod scanner;
@@ -166,7 +172,11 @@ async fn scan_file(state: State<'_, AppState>, path: String) -> Result<FileRepor
     let issue = if trusted {
         None
     } else {
-        scanner::file_finding(&path, &sha256, verdict.as_ref(), &report, false).map(|finding| {
+        scanner::file_finding(&path, &sha256, verdict.as_ref(), &report, false).map(|mut finding| {
+            {
+                let conn = state.db.lock().unwrap();
+                history::apply(&conn, std::slice::from_mut(&mut finding), db::now());
+            }
             let mut snapshot = state.snapshot.lock().unwrap();
             snapshot.targets.insert(finding.issue.id.clone(), finding.target);
             finding.issue
@@ -213,9 +223,14 @@ async fn resolve_issue(
     let target = dashboard::target_of(&state, &issue_id)
         .ok_or_else(|| "That issue is not in the current results. Run a scan again.".to_string())?;
 
-    if action == "ignore" {
-        dashboard::dismiss(&state, &issue_id);
-        return Ok("Set aside for now.".to_string());
+    if action == "ignore" || action == "bring_back" {
+        let aside = action == "ignore";
+        dashboard::set_aside(&state, &issue_id, aside)?;
+        return Ok(if aside {
+            "Set aside. Later scans keep it aside until it changes.".to_string()
+        } else {
+            "Back in the list.".to_string()
+        });
     }
 
     // The only action that sends anything other than a hash.
@@ -269,11 +284,11 @@ async fn resolve_issue(
         }
 
         (IssueTarget::Connection { ip, .. }, "block_ip")
-        | (IssueTarget::LoginAttempts { ip }, "block_ip") => {
+        | (IssueTarget::LoginAttempts { ip, .. }, "block_ip") => {
             resolve::block_ip(&conn, ip)?;
             format!("{ip} is blocked.")
         }
-        (IssueTarget::Connection { ip, .. }, "trust") | (IssueTarget::LoginAttempts { ip }, "trust") => {
+        (IssueTarget::Connection { ip, .. }, "trust") | (IssueTarget::LoginAttempts { ip, .. }, "trust") => {
             resolve::trust_ip(&conn, ip, note.as_deref())?;
             format!("{ip} will not be reported again.")
         }
@@ -317,42 +332,48 @@ async fn resolve_issue(
 
         (IssueTarget::Packages { names }, "list_packages") => names.join(", "),
 
+        (IssueTarget::BlockProposal { ips }, "block_all") => {
+            let after = { state.config.lock().unwrap().auto_block_after };
+            let blocked = response::block_all(&conn, ips, after)?;
+            let ips = ips.clone();
+            drop(conn);
+            dashboard::dismiss_where(&state, |t| matches!(t, IssueTarget::LoginAttempts { ip, .. } if ips.contains(ip)));
+            dashboard::dismiss(&state, &issue_id);
+            return Ok(format!(
+                "{blocked} {} blocked for {} hours.",
+                if blocked == 1 { "address" } else { "addresses" },
+                response::BLOCK_HOURS
+            ));
+        }
+
         (IssueTarget::Informational, "read_sudoers") => {
             let text = platform::sudoers_privileged()?;
             let found = audit::sudo_findings(&text);
-            let count = found.len();
-            let mut snapshot = state.snapshot.lock().unwrap();
-            for finding in found {
-                snapshot.targets.insert(finding.issue.id.clone(), finding.target);
-                snapshot.status.issues.push(finding.issue);
-            }
-            snapshot.status.finish();
-            if count == 0 {
+            drop(conn);
+            let count = dashboard::add_findings(&state, found);
+            dashboard::dismiss(&state, &issue_id);
+            return Ok(if count == 0 {
                 "The sudo rules were read: none gives root without a password.".to_string()
             } else {
                 format!("The sudo rules were read: {count} thing(s) worth seeing were added to the list.")
-            }
+            });
         }
 
         (IssueTarget::Informational, "read_authlog") => {
             let path = { state.config.lock().unwrap().auth_log_path.clone() };
             let text = authlog::read_privileged(&path)?;
             let threshold = { state.config.lock().unwrap().failed_login_threshold };
-            let found = authlog::findings_from_text(&text, threshold, db::now());
+            let mut found = authlog::findings_from_text(&text, threshold, db::now());
+            response::mark_blocked(&conn, &mut found, db::now());
+            drop(conn);
 
-            let count = found.len();
-            let mut snapshot = state.snapshot.lock().unwrap();
-            for finding in found {
-                snapshot.targets.insert(finding.issue.id.clone(), finding.target);
-                snapshot.status.issues.push(finding.issue);
-            }
-            snapshot.status.finish();
-
-            if count == 0 {
+            let count = dashboard::add_findings(&state, found);
+            dashboard::dismiss(&state, &issue_id);
+            return Ok(if count == 0 {
                 "The log was read: no repeated failures in the last 24 hours.".to_string()
             } else {
                 format!("The log was read: {count} thing(s) worth seeing were added to the list.")
-            }
+            });
         }
 
         (_, other) => return Err(format!("\"{other}\" cannot be done to this kind of issue.")),
@@ -460,6 +481,120 @@ fn revert_action(state: State<'_, AppState>, id: i64) -> Result<String, String> 
 #[tauri::command]
 fn list_autostart() -> Vec<autostart::AutostartEntry> {
     autostart::list()
+}
+
+// --- history, reports and evidence ----------------------------------------
+
+/// A path the user chose in a save dialog, refused when it is relative.
+fn chosen_path(path: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(path.trim());
+    if !path.is_absolute() {
+        return Err("Choose where to save it.".to_string());
+    }
+    Ok(path)
+}
+
+fn write_text(path: &str, text: &str) -> Result<String, String> {
+    let path = chosen_path(path)?;
+    std::fs::write(&path, text).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
+    Ok(format!("Saved to {}.", path.display()))
+}
+
+#[tauri::command]
+fn list_scans(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<ScanRecord>, String> {
+    let conn = state.db.lock().unwrap();
+    db::recent_scans(&conn, limit.unwrap_or(50).clamp(1, 500))
+}
+
+#[tauri::command]
+fn scan_report(state: State<'_, AppState>, scan_id: Option<i64>) -> Result<String, String> {
+    let conn = state.db.lock().unwrap();
+    report::scan_text(&conn, scan_id)
+}
+
+#[tauri::command]
+fn export_report(state: State<'_, AppState>, scan_id: Option<i64>, path: String) -> Result<String, String> {
+    let text = {
+        let conn = state.db.lock().unwrap();
+        report::scan_text(&conn, scan_id)?
+    };
+    write_text(&path, &text)
+}
+
+#[tauri::command]
+fn compare_scans(state: State<'_, AppState>, older: Option<i64>, newer: Option<i64>) -> Result<report::Comparison, String> {
+    let conn = state.db.lock().unwrap();
+    report::comparison(&conn, older, newer)
+}
+
+#[tauri::command]
+fn export_comparison(
+    state: State<'_, AppState>,
+    older: Option<i64>,
+    newer: Option<i64>,
+    path: String,
+) -> Result<String, String> {
+    let text = {
+        let conn = state.db.lock().unwrap();
+        report::render_comparison(&report::comparison(&conn, older, newer)?)
+    };
+    write_text(&path, &text)
+}
+
+/// Saves an issue from the current results as an evidence archive.
+#[tauri::command]
+async fn export_evidence(state: State<'_, AppState>, issue_id: String, path: String) -> Result<String, String> {
+    let (issue, target) = dashboard::issue_of(&state, &issue_id)
+        .ok_or_else(|| "That issue is not in the current results. Run a scan again.".to_string())?;
+    let auth_log = { state.config.lock().unwrap().auth_log_path.clone() };
+    let path = chosen_path(&path)?;
+    let conn = state.db.lock().unwrap();
+    evidence::export_issue(&conn, &issue, &target, &auth_log, &path)
+}
+
+#[tauri::command]
+async fn export_quarantine_evidence(state: State<'_, AppState>, id: String, path: String) -> Result<String, String> {
+    let path = chosen_path(&path)?;
+    let conn = state.db.lock().unwrap();
+    evidence::export_quarantined(&conn, &id, &path)
+}
+
+/// Looks inside a quarantined file without running it.
+#[tauri::command]
+async fn inspect_quarantined(state: State<'_, AppState>, id: String) -> Result<inspect::Inspection, String> {
+    let entry = {
+        let conn = state.db.lock().unwrap();
+        db::get_quarantine(&conn, &id)?.ok_or_else(|| "That quarantine entry no longer exists.".to_string())?
+    };
+    let mut limits = { content::Limits::for_config(&state.config.lock().unwrap()) };
+    limits.own_rules = indicators::load_rules().rules;
+    limits.indicators = std::sync::Arc::new(indicators::Indicators::load());
+    tokio::task::spawn_blocking(move || {
+        quarantine::with_readable(&entry, |path| inspect::inspect(path, &entry.original_path, &limits))?
+    })
+    .await
+    .map_err(|e| format!("The file could not be inspected: {e}"))?
+}
+
+#[derive(Serialize)]
+struct CaptureView {
+    #[serde(flatten)]
+    capture: pcap::Capture,
+    /// Indicator matches added to the Status list.
+    added: usize,
+}
+
+/// Reads a capture the user saved and compares its addresses with the indicators.
+#[tauri::command]
+async fn read_capture(state: State<'_, AppState>, path: String) -> Result<CaptureView, String> {
+    let path = chosen_path(&path)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let indicators = indicators::Indicators::load();
+    let capture = tokio::task::spawn_blocking(move || pcap::read(&path, &indicators))
+        .await
+        .map_err(|e| format!("The capture could not be read: {e}"))??;
+    let added = dashboard::add_findings(&state, pcap::findings(&capture, &name));
+    Ok(CaptureView { capture, added })
 }
 
 // --- settings and facts about the installation ----------------------------
@@ -661,6 +796,15 @@ pub fn run() {
             list_action_log,
             revert_action,
             list_autostart,
+            list_scans,
+            scan_report,
+            export_report,
+            compare_scans,
+            export_comparison,
+            export_evidence,
+            export_quarantine_evidence,
+            inspect_quarantined,
+            read_capture,
             get_config,
             set_config,
             system_info,

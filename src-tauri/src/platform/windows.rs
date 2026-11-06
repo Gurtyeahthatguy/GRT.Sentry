@@ -373,6 +373,20 @@ pub fn unblock_address(ip: &IpAddr) -> Result<(), String> {
     run_plain("netsh", &["advfirewall", "firewall", "delete", "rule", &name]).map(|_| ())
 }
 
+/// A firewall rule has no timeout, so the scan removes it when its day is over.
+pub const BLOCKS_EXPIRE: bool = false;
+
+pub fn block_for(ips: &[IpAddr], _hours: i64) -> Result<(), String> {
+    for ip in ips {
+        block_address(ip)?;
+    }
+    Ok(())
+}
+
+pub fn unblock_for(ip: &IpAddr) -> Result<(), String> {
+    unblock_address(ip)
+}
+
 pub fn firewall_ready() -> bool {
     run_plain("netsh", &["advfirewall", "show", "allprofiles", "state"]).is_ok()
 }
@@ -408,6 +422,11 @@ fn process_names() -> std::collections::HashMap<i32, String> {
 
 pub fn process_name(pid: i32) -> Option<String> {
     process_names().get(&pid).cloned()
+}
+
+/// The program a process runs, as the system names it.
+pub fn process_executable(pid: i32) -> PathBuf {
+    image_path(pid as u32).map(PathBuf::from).unwrap_or_default()
 }
 
 pub fn process_exists(pid: i32) -> bool {
@@ -916,20 +935,43 @@ pub fn schedule_status() -> ScheduleStatus {
 /// Windows ships no command that raises a notification, so this goes through
 /// the balloon PowerShell can build from the forms assembly. The text is
 /// generated here and holds no file name, which keeps the quoting safe.
-pub fn notify(title: &str, body: &str, _urgent: bool) {
-    let safe = |text: &str| text.replace('\'', "").replace('"', "");
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; \
-         $n = New-Object System.Windows.Forms.NotifyIcon; \
-         $n.Icon = [System.Drawing.SystemIcons]::Warning; \
-         $n.Visible = $true; \
-         $n.ShowBalloonTip(10000, '{}', '{}', 'Warning'); \
-         Start-Sleep -Seconds 10",
-        safe(title),
-        safe(body)
-    );
+/// Every Windows has it, so a toast sent under it always shows.
+const POWERSHELL_APP_ID: &str = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
 
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-        .status();
+/// The installer gives its Start menu shortcut the bundle identifier, which
+/// is what lets a toast carry GRT Sentry's name. The portable copy has none.
+fn toast_app_id() -> &'static str {
+    let installed = ["APPDATA", "ProgramData"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|base| PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs"))
+        .any(|programs| programs.join("GRT Sentry.lnk").exists() || programs.join(r"GRT Sentry\GRT Sentry.lnk").exists());
+    if installed { "org.grt.sentry" } else { POWERSHELL_APP_ID }
+}
+
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// A toast in the notification centre, through the system's own API.
+pub fn notify(title: &str, body: &str, urgent: bool) {
+    use windows::core::HSTRING;
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+
+    let xml = format!(
+        r#"<toast duration="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>"#,
+        if urgent { "long" } else { "short" },
+        xml_text(title),
+        xml_text(body)
+    );
+    let shown = (|| -> windows::core::Result<()> {
+        let document = XmlDocument::new()?;
+        document.LoadXml(&HSTRING::from(xml))?;
+        let toast = ToastNotification::CreateToastNotification(&document)?;
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(toast_app_id()))?.Show(&toast)
+    })();
+    if let Err(e) = shown {
+        eprintln!("grt-sentry: the notification could not be shown: {e}");
+    }
 }
