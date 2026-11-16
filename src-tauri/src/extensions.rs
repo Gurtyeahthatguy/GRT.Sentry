@@ -151,10 +151,17 @@ pub fn parse_chromium(text: &str, browser: &str, profile_dir: &Path) -> Vec<Exte
         .collect()
 }
 
+/// A version folder's name as numbers, so 10.0_0 comes after 9.0_0.
+fn version_key(path: &Path) -> Vec<u64> {
+    path.file_name()
+        .map(|n| n.to_string_lossy().split(['.', '_']).map(|p| p.parse().unwrap_or(0)).collect())
+        .unwrap_or_default()
+}
+
 /// The manifest of the newest installed version of an extension.
 fn read_manifest(dir: &Path) -> Option<Value> {
     let mut versions: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
-    versions.sort();
+    versions.sort_by_key(|v| version_key(v));
     let text = std::fs::read_to_string(versions.last()?.join("manifest.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -261,6 +268,16 @@ fn finding(extension: &Extension) -> Finding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_newest_version_folder_is_the_highest_number_not_the_last_word() {
+        let dir = tempfile::tempdir().unwrap();
+        for (version, name) in [("9.0_0", "old"), ("10.0_0", "new")] {
+            std::fs::create_dir(dir.path().join(version)).unwrap();
+            std::fs::write(dir.path().join(version).join("manifest.json"), format!(r#"{{"name":"{name}"}}"#)).unwrap();
+        }
+        assert_eq!(read_manifest(dir.path()).unwrap()["name"], "new");
+    }
 
     const FIREFOX: &str = r#"{"addons":[
         {"id":"adguardadblocker@adguard.com","type":"extension","location":"app-profile","signedState":2,

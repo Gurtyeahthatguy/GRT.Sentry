@@ -12,6 +12,7 @@ export function initSettings(onThemeChange) {
   document.getElementById("btn-clear-key").addEventListener("click", clearKey);
   document.getElementById("btn-save-schedule").addEventListener("click", saveSchedule);
   document.getElementById("watch-folders").addEventListener("change", toggleWatcher);
+  document.getElementById("decoy").addEventListener("change", toggleDecoy);
 }
 
 export async function load() {
@@ -40,6 +41,8 @@ function fill(config) {
   document.getElementById("check-system").checked = config.check_system;
   document.getElementById("scan-on-startup").checked = config.scan_on_startup;
   document.getElementById("watch-folders").checked = config.watch_folders;
+  document.getElementById("decoy").checked = config.decoy;
+  document.getElementById("decoy-port").value = config.decoy_port;
   document.getElementById("auto-quarantine").checked = config.auto_quarantine;
   document.getElementById("auto-threshold").value = config.auto_quarantine_threshold;
   document.getElementById("auto-block").checked = config.auto_block;
@@ -61,8 +64,11 @@ function lines(id) {
     .filter(Boolean);
 }
 
+/** A number field, or undefined when it is empty so the setting stays as it was. */
 function number(id) {
-  const value = Number(document.getElementById(id).value);
+  const text = document.getElementById(id).value.trim();
+  if (text === "") return undefined;
+  const value = Number(text);
   return Number.isFinite(value) ? value : undefined;
 }
 
@@ -83,13 +89,17 @@ async function save(onThemeChange) {
     vt_interval_seconds: number("vt-interval"),
     vt_budget_per_scan: number("vt-budget"),
     connection_refresh_seconds: number("refresh-seconds"),
+    decoy_port: number("decoy-port"),
     auth_log_path: document.getElementById("auth-log").value.trim(),
     failed_login_threshold: number("login-threshold"),
     theme: document.getElementById("theme").value,
   };
 
   try {
+    const portChanged = current && update.decoy_port !== undefined && update.decoy_port !== current.decoy_port;
     current = await api.setConfig(update);
+    // A decoy already listening moves to the new port at once.
+    if (portChanged && current.decoy) await api.setDecoy(true, current.decoy_port);
     fill(current);
     onThemeChange(current.theme);
     document.getElementById("settings-saved").textContent = "Saved.";
@@ -132,6 +142,18 @@ async function toggleWatcher(event) {
   try {
     await api.setWatcher(enabled);
     toast(enabled ? "Watching the scan folders." : "No longer watching.");
+  } catch (error) {
+    event.target.checked = false;
+    toast(errorText(error), true);
+  }
+  loadFacts();
+}
+
+async function toggleDecoy(event) {
+  const enabled = event.target.checked;
+  try {
+    const port = await api.setDecoy(enabled, number("decoy-port"));
+    toast(enabled ? `Listening on port ${port}. Nothing is answered.` : "The decoy port is closed.");
   } catch (error) {
     event.target.checked = false;
     toast(errorText(error), true);
@@ -214,6 +236,8 @@ async function loadFacts() {
         ? info.elevation_note
         : `not available: ${info.elevation_note}. Blocking an address and closing a connection need it.`,
     ],
+    ["confinement", info.confinement],
+    ["decoy port", info.decoy_listening ? `listening on ${info.decoy_listening}` : "off"],
     [
       "folder watcher",
       info.watched_folders.length > 0 ? `watching ${info.watched_folders.join(", ")}` : "off",

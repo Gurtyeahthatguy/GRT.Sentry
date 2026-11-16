@@ -13,8 +13,8 @@ use crate::state::{
     Action, AppState, Finding, Issue, IssueKind, IssueTarget, Severity, Snapshot, SystemStatus,
 };
 use crate::{
-    accounts, actionlog, audit, authlog, autostart, db, extensions, folders, history, indicators, integrity, netmon,
-    packages, platform, privilege, processes, response, rootkit, scanner, updates,
+    accounts, actionlog, audit, authlog, autostart, db, decoy, defender, extensions, folders, history, indicators, integrity, netmon,
+    packages, platform, privilege, processes, response, rootkit, scanner, timeline, updates,
 };
 
 fn phase(name: &str, message: &str) -> scanner::ScanProgress {
@@ -47,11 +47,19 @@ pub async fn scan(
     let _guard = ScanGuard(state);
 
     let config = { state.config.lock().unwrap().clone() };
+    // Only the configured folders describe the machine from one scan to the next.
+    let configured = paths.is_none();
     let scan_paths = paths.unwrap_or_else(|| config.scan_paths.clone());
 
     let mut findings: Vec<Finding> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let own_indicators = indicators::Indicators::load();
+    if !crate::config::Config::load_checked().1 {
+        notes.push(format!(
+            "The configuration file is not valid, so the defaults are in use and the file was left as it is: {}. Correct it by hand; saving from Settings would replace it.",
+            crate::paths::config_path().display()
+        ));
+    }
     {
         let conn = state.db.lock().unwrap();
         response::lift_expired(&conn, db::now());
@@ -69,6 +77,7 @@ pub async fn scan(
     .await;
     let files_checked = outcome.files_checked;
     let queued_files = outcome.queued;
+    let hashed = (configured && !outcome.stopped).then(|| outcome.hashed.into_iter().collect());
     findings.extend(outcome.findings);
     notes.extend(outcome.notes);
 
@@ -113,6 +122,12 @@ pub async fn scan(
         message: "Checking for security updates".into(),
     });
     findings.extend(updates::findings());
+    findings.extend(defender::findings());
+
+    // Without the database, which it does not need: on Windows it checks
+    // signatures, which takes a while.
+    progress(phase("processes", "Checking where running programs come from"));
+    findings.extend(processes::findings(&own_indicators));
 
     // 4, 5, 6. The cheap ones, all reading small files.
     {
@@ -151,11 +166,9 @@ pub async fn scan(
             findings.extend(accounts::account_findings(&conn, &list));
         }
 
-        progress(phase("processes", "Checking where running programs come from"));
-        findings.extend(processes::findings(&own_indicators));
-
         progress(phase("extensions", "Checking browser extensions"));
         findings.extend(extensions::findings(&conn));
+        findings.extend(decoy::findings(&conn, db::now()));
     }
 
     // The deeper system checks, each a walk or a probe of its own.
@@ -228,12 +241,15 @@ pub async fn scan(
     }
     status.finish();
 
+    // Read before the database is locked: on Windows it takes seconds.
+    let seen = timeline::gather(hashed);
     {
         let conn = state.db.lock().unwrap();
         let real_issues = status.issues.iter().filter(|i| i.counts()).count();
         match db::record_scan(&conn, files_checked, real_issues) {
             Ok(id) => {
                 status.scan_id = id;
+                status.changes = timeline::record_all(&conn, id, &seen) as u32;
                 let stored: Vec<_> = status.issues.iter().map(history::stored).collect();
                 if let Err(e) = db::record_scan_issues(&conn, id, &stored) {
                     eprintln!("grt-sentry: the scan's issues could not be kept: {e}");

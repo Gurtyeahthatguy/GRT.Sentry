@@ -29,7 +29,7 @@ fn expand(patterns: &[String]) -> Vec<PathBuf> {
         let expanded = crate::paths::expand_tilde(pattern);
         let text = expanded.to_string_lossy().into_owned();
 
-        if let Some(dir) = text.strip_suffix("/*") {
+        if let Some(dir) = text.strip_suffix("/*").or_else(|| text.strip_suffix("\\*")) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     if entry.path().is_file() {
@@ -171,18 +171,29 @@ fn preload_finding() -> Option<Finding> {
     ))
 }
 
-/// Accepts the current contents of a file as the new reference.
-pub fn accept_current(conn: &Connection, path: &str, current_hash: &str) -> Result<(), String> {
-    // Recomputed rather than trusted, since the file may have changed again.
-    let hash = match scanner::hash_file(Path::new(path)) {
-        Ok(hash) => hash,
-        Err(_) if !current_hash.is_empty() => current_hash.to_string(),
-        Err(e) => return Err(format!("Cannot read {path}: {e}")),
-    };
+/// Accepts the contents the scan reported as the new reference, or the
+/// removal of a file that is gone, and says what was done.
+///
+/// What is accepted is what the user saw. A file that changed again since is
+/// not accepted in passing: the next scan reports the newer change.
+pub fn accept_current(conn: &Connection, path: &str, current_hash: &str) -> Result<String, String> {
+    if current_hash.is_empty() {
+        if Path::new(path).exists() {
+            return Err(format!("{path} is back since the scan. Scan again to see whether it changed."));
+        }
+        db::remove_baseline(conn, path)?;
+        actionlog::record(conn, actionlog::kind::UPDATE_BASELINE, path, Some("removal confirmed by the user"), false);
+        return Ok(format!("{path} is no longer watched."));
+    }
 
-    db::set_baseline(conn, path, &hash)?;
+    db::set_baseline(conn, path, current_hash)?;
     actionlog::record(conn, actionlog::kind::UPDATE_BASELINE, path, Some("confirmed by the user"), false);
-    Ok(())
+    let now = scanner::hash_file(Path::new(path)).ok();
+    Ok(if now.as_deref() == Some(current_hash) {
+        format!("The current contents of {path} are the new reference.")
+    } else {
+        format!("The contents you saw are the reference. {path} has changed again since the scan, and the next scan will show it.")
+    })
 }
 
 #[cfg(test)]
@@ -235,7 +246,8 @@ mod tests {
 
         // Accepting it makes the new contents the reference, and the next
         // scan is quiet again.
-        accept_current(&conn, &file.to_string_lossy(), "").unwrap();
+        let IssueTarget::Integrity { current_hash, .. } = &found[0].target else { panic!() };
+        accept_current(&conn, &file.to_string_lossy(), current_hash).unwrap();
         assert!(findings(&conn, &watched).is_empty());
     }
 
@@ -253,6 +265,10 @@ mod tests {
         let found = findings(&conn, &watched);
         assert_eq!(found.len(), 1);
         assert!(found[0].issue.title.contains("gone"));
+
+        // A removal can be accepted too, and is then not reported again.
+        accept_current(&conn, &file.to_string_lossy(), "").unwrap();
+        assert!(findings(&conn, &watched).is_empty());
     }
 
     #[test]
@@ -265,16 +281,22 @@ mod tests {
     }
 
     #[test]
-    fn accepting_uses_what_is_on_disk_now_rather_than_what_it_was_told() {
+    fn a_change_made_after_the_scan_is_not_accepted_in_passing() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("passwd");
         std::fs::write(&file, b"root:x:0:0\n").unwrap();
-
+        let watched = vec![file.to_string_lossy().into_owned()];
         let conn = crate::db::open_memory();
-        accept_current(&conn, &file.to_string_lossy(), "a-stale-hash").unwrap();
+        findings(&conn, &watched);
 
-        let stored = db::baseline_hash(&conn, &file.to_string_lossy()).unwrap();
-        assert_eq!(stored, scanner::hash_file(&file).unwrap());
-        assert_ne!(stored, "a-stale-hash");
+        std::fs::write(&file, b"root:x:0:0\nme:x:1000:1000\n").unwrap();
+        let seen = findings(&conn, &watched);
+        let IssueTarget::Integrity { current_hash, .. } = &seen[0].target else { panic!() };
+
+        // Changed once more between the scan and the click.
+        std::fs::write(&file, b"root:x:0:0\ntoor:x:0:0\n").unwrap();
+        let message = accept_current(&conn, &file.to_string_lossy(), current_hash).unwrap();
+        assert!(message.contains("changed again"), "{message}");
+        assert_eq!(findings(&conn, &watched).len(), 1, "the newer change is still reported");
     }
 }

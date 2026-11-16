@@ -18,6 +18,7 @@ GRT Sentry, a local security scanner
   grt-sentry --report        print the last scan in full, to save or send
   grt-sentry --compare       print what changed between the last two scans
   grt-sentry --connections   list the active network connections
+  grt-sentry --decoy         listen on the decoy port until stopped, and print who knocks
   grt-sentry --where         print where the data, configuration and quarantine live
   grt-sentry --version       print the version
   grt-sentry --help          print this
@@ -49,6 +50,7 @@ pub fn maybe_run() -> Option<i32> {
         "--report" => Some(print_report(false)),
         "--compare" => Some(print_report(true)),
         "--connections" => Some(print_connections()),
+        "--decoy" => Some(run_decoy()),
         _ => None,
     }
 }
@@ -159,6 +161,24 @@ fn print_report(compare: bool) -> i32 {
             eprintln!("grt-sentry: {e}");
             2
         }
+    }
+}
+
+/// The decoy in a terminal, until Ctrl-C or the end of the session.
+fn run_decoy() -> i32 {
+    let port = crate::config::Config::load().decoy_port;
+    let decoy = match crate::decoy::start(port, |hit| {
+        println!("{}  {} knocked on port {}", crate::report::local_time(crate::db::now()), hit.ip, hit.port);
+    }) {
+        Ok(decoy) => decoy,
+        Err(e) => {
+            eprintln!("grt-sentry: {e}");
+            return 2;
+        }
+    };
+    println!("Listening on port {}. Nothing is answered; every knock is noted for the next scan.", decoy.port);
+    loop {
+        std::thread::park();
     }
 }
 
@@ -274,7 +294,7 @@ mod tests {
 
     #[test]
     fn the_usage_text_lists_every_mode_the_parser_accepts() {
-        for mode in ["--scan", "--status", "--report", "--compare", "--connections", "--where", "--version", "--help"] {
+        for mode in ["--scan", "--status", "--report", "--compare", "--connections", "--decoy", "--where", "--version", "--help"] {
             assert!(USAGE.contains(mode), "{mode} is accepted but not documented");
         }
     }

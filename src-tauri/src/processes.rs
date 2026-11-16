@@ -29,6 +29,8 @@ pub enum Oddity {
     Downloads { path: String },
     /// A path or name in the user's own indicators.
     Indicator { path: String, note: String },
+    /// A program under the user's profile with no valid signature, on Windows.
+    Unsigned { path: String },
 }
 
 /// Folders where a running program is a reason to look.
@@ -76,12 +78,24 @@ pub fn findings(indicators: &Indicators) -> Vec<Finding> {
 
     let mut findings = Vec::new();
     let mut replaced: Vec<String> = Vec::new();
+    // A browser runs twenty processes from one file, which is checked once.
+    let mut signatures: std::collections::HashMap<String, Option<bool>> = std::collections::HashMap::new();
+    let mut unsigned = |process: &ProcessInfo| -> Option<Oddity> {
+        let exe = process.exe.as_deref()?;
+        if !platform::in_user_profile(exe) {
+            return None;
+        }
+        let signed = *signatures.entry(exe.to_string()).or_insert_with(|| platform::signed(Path::new(exe)));
+        (signed == Some(false)).then(|| Oddity::Unsigned { path: exe.to_string() })
+    };
 
     for process in platform::processes() {
         if process.pid == mine {
             continue;
         }
-        let Some(oddity) = classify(&process, &downloads, indicators, &exists) else { continue };
+        let Some(oddity) = classify(&process, &downloads, indicators, &exists).or_else(|| unsigned(&process)) else {
+            continue;
+        };
         if let Oddity::Replaced { .. } = oddity {
             replaced.push(format!("{} (pid {})", process.name, process.pid));
             continue;
@@ -150,6 +164,13 @@ fn finding(process: &ProcessInfo, oddity: &Oddity) -> Finding {
             Severity::Critical,
             format!("{who} matches one of your indicators"),
             format!("Its executable is {path}, which your indicators file lists: {note}"),
+        ),
+        Oddity::Unsigned { path } => (
+            Severity::Warning,
+            format!("{who} runs unsigned from your profile"),
+            format!(
+                "Its executable is {path}, under the user profile where anything running as you can write, and it carries no valid signature. Programs installed there, such as browsers and chat clients, are almost always signed by their maker; one that is not deserves a look."
+            ),
         ),
         Oddity::Replaced { .. } => unreachable!("grouped by the caller"),
     };

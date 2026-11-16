@@ -124,8 +124,12 @@ pub fn summarise(text: &str, now: i64) -> (HashMap<String, Vec<Failure>>, usize)
     let mut by_address: HashMap<String, Vec<Failure>> = HashMap::new();
     let mut local = 0usize;
 
-    for line in text.lines() {
-        let Some(failure) = parse_line(line, now) else { continue };
+    let failures: Vec<Failure> = if crate::winevents::is_event_xml(text) {
+        crate::winevents::failures(&crate::winevents::parse(text, now))
+    } else {
+        text.lines().filter_map(|line| parse_line(line, now)).collect()
+    };
+    for failure in failures {
         if now - failure.timestamp > WINDOW {
             continue;
         }
@@ -179,6 +183,9 @@ pub fn findings(conn: &Connection, log_path: &str, threshold: u32) -> Vec<Findin
 
     let now = crate::db::now();
     let mut found = findings_from_text(&text, threshold, now);
+    if crate::winevents::is_event_xml(&text) {
+        found.extend(crate::winevents::account_findings(conn, &crate::winevents::parse(&text, now), now));
+    }
     // "Expected" on an address means it is not reported again.
     found.retain(|f| !matches!(&f.target, IssueTarget::LoginAttempts { ip, .. } if crate::db::ip_trusted(conn, ip)));
     found.extend(crate::accounts::login_findings(conn, &text, now));

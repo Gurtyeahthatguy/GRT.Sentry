@@ -116,6 +116,9 @@ impl Connection {
 /// One row per socket, enriched with process, location and history.
 pub fn snapshot(conn: &rusqlite::Connection, geo: Option<&GeoDb>) -> Result<Vec<Connection>, String> {
     let mut out = Vec::new();
+    // New means new since the last scan, so a look at the Connections tab in
+    // between does not use up the first sighting.
+    let since = db::recent_scans(conn, 1).ok().and_then(|s| s.first().map(|s| s.timestamp)).unwrap_or(i64::MAX);
 
     for raw in platform::sockets()? {
         let remote_ip = platform::normalise(raw.remote_addr);
@@ -127,7 +130,7 @@ pub fn snapshot(conn: &rusqlite::Connection, geo: Option<&GeoDb>) -> Result<Vec<
             (false, true, None)
         } else {
             match db::observe_ip(conn, &remote_addr) {
-                Ok(record) => (record.is_new, record.trusted, record.label),
+                Ok(record) => (record.is_new || record.first_seen > since, record.trusted, record.label),
                 Err(_) => (false, false, None),
             }
         };

@@ -20,8 +20,12 @@ pub fn install(frequency: &str) -> Result<(), String> {
         return Err("The schedule can be hourly, daily or weekly.".to_string());
     }
 
-    let executable = std::env::current_exe()
-        .map_err(|e| format!("Cannot determine this program's own path: {e}"))?;
+    // An AppImage runs from a mount that is gone once it exits, so the
+    // scheduler is given the AppImage itself.
+    let executable = match std::env::var_os("APPIMAGE").filter(|p| !p.is_empty()) {
+        Some(image) => std::path::PathBuf::from(image),
+        None => std::env::current_exe().map_err(|e| format!("Cannot determine this program's own path: {e}"))?,
+    };
 
     platform::schedule_install(frequency, &executable)
 }

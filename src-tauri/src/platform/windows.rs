@@ -49,6 +49,10 @@ fn profile() -> PathBuf {
     env_dir("USERPROFILE", "C:\\Users\\Default")
 }
 
+pub fn home_dir() -> PathBuf {
+    profile()
+}
+
 /// `%LOCALAPPDATA%`, which is where data that should not roam belongs.
 pub fn data_dir() -> PathBuf {
     match std::env::var_os("LOCALAPPDATA") {
@@ -180,40 +184,35 @@ fn port_of(raw: u32) -> u16 {
     u16::from_be_bytes([(raw & 0xff) as u8, ((raw >> 8) & 0xff) as u8])
 }
 
-/// Asks for the table twice: once for the size, once for the contents.
+/// Asks for the table's size, then its contents, again if it grew in between.
 fn tcp_table(family: u32) -> Result<Vec<u8>, String> {
     let mut size: u32 = 0;
     // The first call is expected to fail, and only sets the size.
     unsafe {
-        GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            family,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
+        GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0);
     }
     if size == 0 {
         return Ok(Vec::new());
     }
 
-    let mut buffer = vec![0u8; size as usize];
-    let result = unsafe {
-        GetExtendedTcpTable(
-            buffer.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            family,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-    if result != NO_ERROR {
-        return Err(format!("the TCP table could not be read (error {result})"));
+    let mut result = NO_ERROR;
+    for _ in 0..4 {
+        // Room for connections opened since the size was asked.
+        size += 4096;
+        let mut buffer = vec![0u8; size as usize];
+        result = unsafe {
+            GetExtendedTcpTable(buffer.as_mut_ptr() as *mut _, &mut size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0)
+        };
+        if result == NO_ERROR {
+            buffer.truncate(size as usize);
+            return Ok(buffer);
+        }
+        // 122 is ERROR_INSUFFICIENT_BUFFER, with `size` set to what is needed now.
+        if result != 122 {
+            break;
+        }
     }
-    buffer.truncate(size as usize);
-    Ok(buffer)
+    Err(format!("the TCP table could not be read (error {result})"))
 }
 
 /// Every TCP connection with a peer, from the Win32 socket table.
@@ -498,19 +497,6 @@ pub fn run_plain(program: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-pub fn run_privileged(program: &str, args: &[&str]) -> Result<String, String> {
-    require_elevation()?;
-    run_plain(program, args)
-}
-
-pub fn run_privileged_capture(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    require_elevation()?;
-    Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Cannot run {program}: {e}"))
-}
-
 // --- pending updates ------------------------------------------------------
 
 pub fn updates_tool_available() -> bool {
@@ -644,6 +630,88 @@ fn image_path(pid: u32) -> Option<String> {
     (ok != 0).then(|| String::from_utf16_lossy(&buffer[..size as usize]))
 }
 
+// --- signatures, Defender, and this process -------------------------------
+
+/// Whether a file carries a valid Authenticode signature of its own.
+///
+/// Revocation is not checked, since that would go to the network. A file
+/// signed through a system catalog rather than in itself reads as unsigned,
+/// which is why only programs under the user's profile are asked about.
+pub fn signed(path: &Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
+        WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
+        WTD_UI_NONE,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut file: WINTRUST_FILE_INFO = unsafe { std::mem::zeroed() };
+    file.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
+    file.pcwszFilePath = wide.as_ptr();
+
+    let mut data: WINTRUST_DATA = unsafe { std::mem::zeroed() };
+    data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.Anonymous.pFile = &mut file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
+
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let result = unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _) };
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data as *mut _ as *mut _) };
+
+    // Anything but zero is no signature or a bad one.
+    Some(result == 0)
+}
+
+/// Folders under the profile, where anyone logged in as the user can put a program.
+pub fn in_user_profile(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    ["LOCALAPPDATA", "APPDATA", "USERPROFILE", "PUBLIC"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .filter(|base| !base.is_empty())
+        .any(|base| lower.starts_with(&base.to_ascii_lowercase()))
+}
+
+/// Defender's state, as JSON from PowerShell.
+pub fn defender_status() -> Option<Result<String, String>> {
+    Some(run_plain(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-MpComputerStatus | Select-Object AMRunningMode,AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureAge,IsTamperProtected | ConvertTo-Json -Compress",
+        ],
+    ))
+}
+
+/// Narrows what this process will load, where it cannot break the window.
+///
+/// No libraries from network shares or from low-integrity files, and System32
+/// before the program's own folder. Nothing stricter: an AppContainer cannot
+/// host a WebView2 desktop window, and blocking injected libraries would
+/// also block screen readers.
+pub fn harden_process() {
+    use windows_sys::Win32::System::Threading::{ProcessImageLoadPolicy, SetProcessMitigationPolicy};
+    // NoRemoteImages, NoLowMandatoryLabelImages and PreferSystem32Images.
+    let flags: u32 = 0b111;
+    unsafe {
+        SetProcessMitigationPolicy(ProcessImageLoadPolicy, &flags as *const u32 as *const _, std::mem::size_of::<u32>());
+    }
+}
+
+/// What confines this process, in one line for the settings page.
+pub fn confinement() -> String {
+    "Libraries load only from this machine and System32 first. Windows offers no profile like AppArmor for a desktop program, so the rest of the confinement is the account's own rights."
+        .to_string()
+}
+
 /// Every process, with its executable's path when it can be opened. A path
 /// that no longer exists is marked the way Linux marks it.
 pub fn processes() -> Vec<ProcessInfo> {
@@ -716,6 +784,51 @@ pub fn accounts() -> Option<Vec<Account>> {
     None
 }
 
+/// Local accounts for the record of the machine, from PowerShell.
+pub fn account_list() -> Option<std::collections::BTreeMap<String, String>> {
+    let json = run_plain(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-LocalUser | Select-Object Name,Enabled,@{n='Sid';e={$_.SID.Value}} | ConvertTo-Json -Compress",
+        ],
+    )
+    .ok()?;
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let users = match value {
+        serde_json::Value::Array(list) => list,
+        single => vec![single],
+    };
+    Some(
+        users
+            .iter()
+            .filter_map(|u| {
+                let name = u.get("Name")?.as_str()?.to_string();
+                let enabled = if u.get("Enabled").and_then(|e| e.as_bool()).unwrap_or(false) { "enabled" } else { "disabled" };
+                let sid = u.get("Sid").and_then(|s| s.as_str()).unwrap_or("");
+                Some((name, format!("{enabled}, {sid}")))
+            })
+            .collect(),
+    )
+}
+
+/// Installed programs, display name to version, from the uninstall keys.
+pub fn installed_packages() -> Option<std::collections::BTreeMap<String, String>> {
+    let mut all = std::collections::BTreeMap::new();
+    for key in [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        if let Ok(text) = run_plain("reg", &["query", key, "/s"]) {
+            all.extend(crate::timeline::parse_uninstall_keys(&text.replace("\r\n", "\n")));
+        }
+    }
+    (!all.is_empty()).then_some(all)
+}
+
 pub fn sshd_config() -> Option<String> {
     None
 }
@@ -741,57 +854,67 @@ pub fn journal_auth() -> LogAccess {
 // --- what starts by itself ------------------------------------------------
 
 /// Every source the list below reads.
-pub const AUTOSTART_SOURCES: &[&str] = &["user registry", "system registry", "startup folder", "scheduled task"];
+/// The places added after 0.5 are sources of their own, so their first look
+/// records rather than reports.
+pub const AUTOSTART_SOURCES: &[&str] = &[
+    "user registry",
+    "system registry",
+    "startup folder",
+    "scheduled task",
+    "run once",
+    "system registry, 32-bit",
+    "common startup folder",
+];
+
+const RUN: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 pub fn autostart_entries() -> Vec<AutostartEntry> {
     let mut entries = Vec::new();
-    entries.extend(run_keys("HKCU", "user registry"));
-    entries.extend(run_keys("HKLM", "system registry"));
-    entries.extend(startup_folder());
+    entries.extend(run_keys(&format!("HKCU\\{RUN}"), "user registry"));
+    entries.extend(run_keys(&format!("HKLM\\{RUN}"), "system registry"));
+    entries.extend(run_keys(&format!("HKCU\\{RUN}Once"), "run once"));
+    entries.extend(run_keys(&format!("HKLM\\{RUN}Once"), "run once"));
+    entries.extend(run_keys(r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run", "system registry, 32-bit"));
+    entries.extend(startup_folder(&config_dir().join(STARTUP), "startup folder"));
+    entries.extend(startup_folder(&env_dir("ProgramData", "C:\\ProgramData").join(STARTUP), "common startup folder"));
     entries.extend(scheduled_tasks());
     entries
 }
 
-/// `reg query` prints `    Name    REG_SZ    Value`, which is stable across
-/// Windows versions and not translated.
-fn run_keys(hive: &str, source: &str) -> Vec<AutostartEntry> {
-    let key = format!("{hive}\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let Ok(text) = run_plain("reg", &["query", &key]) else {
+const STARTUP: &str = "Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+
+/// One registry key's values, read by `crate::autostart::parse_reg_values`.
+fn run_keys(key: &str, source: &str) -> Vec<AutostartEntry> {
+    let Ok(text) = run_plain("reg", &["query", key]) else {
         return vec![];
     };
-
-    text.lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let name = parts.next()?;
-            let kind = parts.next()?;
-            if !kind.starts_with("REG_") {
-                return None;
-            }
-            let command = line.split_once(kind)?.1.trim().to_string();
-            Some(AutostartEntry {
-                key: format!("{source}:{name}"),
-                source: source.to_string(),
-                name: name.to_string(),
-                command,
-            })
+    // The key's own path says which hive, so two keys feeding one source differ.
+    let hive = key.split('\\').next().unwrap_or("");
+    crate::autostart::parse_reg_values(&text)
+        .into_iter()
+        .map(|(name, command)| AutostartEntry {
+            key: if source == "run once" { format!("{source}:{hive}:{name}") } else { format!("{source}:{name}") },
+            source: source.to_string(),
+            name,
+            command,
         })
         .collect()
 }
 
-fn startup_folder() -> Vec<AutostartEntry> {
-    let dir = config_dir().join("Microsoft\\Windows\\Start Menu\\Programs\\Startup");
-    let Ok(read) = fs::read_dir(&dir) else {
+fn startup_folder(dir: &Path, source: &str) -> Vec<AutostartEntry> {
+    let Ok(read) = fs::read_dir(dir) else {
         return vec![];
     };
 
     read.flatten()
         .filter(|entry| entry.path().is_file())
+        // Explorer keeps a hidden desktop.ini in the folder.
+        .filter(|entry| !entry.file_name().eq_ignore_ascii_case("desktop.ini"))
         .map(|entry| {
             let file = entry.file_name().to_string_lossy().into_owned();
             AutostartEntry {
-                key: format!("startup folder:{file}"),
-                source: "startup folder".to_string(),
+                key: format!("{source}:{file}"),
+                source: source.to_string(),
                 name: file.clone(),
                 command: entry.path().to_string_lossy().into_owned(),
             }
@@ -823,17 +946,16 @@ fn scheduled_tasks() -> Vec<AutostartEntry> {
 
 pub fn entry_path_for(source: &str, file: &str) -> Option<PathBuf> {
     match source {
-        "startup folder" => {
-            Some(config_dir().join("Microsoft\\Windows\\Start Menu\\Programs\\Startup").join(file))
-        }
+        "startup folder" => Some(config_dir().join(STARTUP).join(file)),
+        "common startup folder" => Some(env_dir("ProgramData", "C:\\ProgramData").join(STARTUP).join(file)),
         _ => None,
     }
 }
 
 // --- failed logons --------------------------------------------------------
 
-/// Event 4625 is a failed logon. Reading the Security log needs an elevated
-/// process, which is why this reports Denied rather than failing.
+/// Events 4625, 4720 and 4732, as XML. Reading the Security log needs an
+/// elevated process, which is why this reports Denied rather than failing.
 pub fn read_auth_log(_path: &str) -> LogAccess {
     if !is_elevated() {
         return LogAccess::Denied;
@@ -850,10 +972,10 @@ fn read_security_log() -> Result<String, String> {
         &[
             "qe",
             "Security",
-            "/q:*[System[(EventID=4625)]]",
+            "/q:*[System[(EventID=4625 or EventID=4720 or EventID=4732)]]",
             "/rd:true",
-            "/c:400",
-            "/f:text",
+            "/c:600",
+            "/f:xml",
         ],
     )
 }

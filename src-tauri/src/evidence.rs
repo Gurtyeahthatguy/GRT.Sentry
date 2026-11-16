@@ -107,8 +107,11 @@ fn samples_for(conn: &Connection, target: &IssueTarget) -> Vec<Sample> {
                     samples.extend(quarantined_sample(&entry));
                 }
             }
+            // Only the bytes the scan saw: a file swapped since, or a link put
+            // in its place, could be something private.
             if samples.is_empty() {
-                if let Some(bytes) = read_sample(Path::new(path)) {
+                let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_SAMPLE);
+                if let Some(bytes) = small.then(|| crate::scanner::read_as_scanned(Path::new(path), sha256).ok()).flatten() {
                     samples.push(Sample { origin: path.clone(), bytes });
                 }
             }

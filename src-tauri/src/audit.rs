@@ -45,14 +45,14 @@ fn ssh_option<'a>(config: &'a str, name: &str) -> Option<&'a str> {
             continue;
         }
         // A Match block applies to some connections only; what follows it is
-        // not the global value.
-        let mut words = line.split_whitespace();
+        // not the global value. sshd takes `Key value` and `Key=value` alike.
+        let mut words = line.splitn(2, |c: char| c.is_whitespace() || c == '=');
         let Some(key) = words.next() else { continue };
         if key.eq_ignore_ascii_case("match") {
             return None;
         }
         if key.eq_ignore_ascii_case(name) {
-            return words.next();
+            return words.next().map(|v| v.trim_start_matches(|c: char| c.is_whitespace() || c == '=')).and_then(|v| v.split_whitespace().next());
         }
     }
     None
@@ -93,7 +93,9 @@ pub fn ssh_findings(config: &str, listening: bool) -> Vec<Finding> {
 /// sudo rules that give root without a password, read line by line.
 pub fn sudo_findings(text: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    for raw in text.lines() {
+    // A rule may go on over several lines, each but the last ending in \.
+    let joined = text.replace("\\\n", " ");
+    for raw in joined.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('@') || (line.starts_with("Defaults") && !line.contains("!authenticate")) {
             continue;
@@ -183,6 +185,17 @@ fn weak(severity: Severity, title: &str, location: &str, detail: &str) -> Findin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rule_over_two_lines_and_an_option_with_an_equals_sign_are_read() {
+        let found = sudo_findings("deploy ALL=(ALL) \\\n    NOPASSWD: ALL\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].issue.title, "deploy becomes root without a password");
+
+        assert_eq!(ssh_option("PermitRootLogin=yes\n", "PermitRootLogin"), Some("yes"));
+        assert_eq!(ssh_option("PermitRootLogin = no # comment\n", "PermitRootLogin"), Some("no"));
+        assert_eq!(ssh_option("  Port 2222\n", "Port"), Some("2222"));
+    }
 
     #[test]
     fn the_first_ssh_value_wins_and_match_blocks_do_not_count() {

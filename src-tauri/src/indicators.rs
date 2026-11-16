@@ -117,9 +117,12 @@ impl Indicators {
     }
 
     pub fn match_path(&self, path: &str) -> Option<String> {
+        // Windows paths ignore case, and so does the comparison there.
+        let fold = |text: &str| if cfg!(windows) { text.to_lowercase() } else { text.to_string() };
+        let path = fold(path);
         self.find(|i| match i {
-            Indicator::Path(p) if p.ends_with(['/', '\\']) => path.starts_with(p.as_str()),
-            Indicator::Path(p) => path == p,
+            Indicator::Path(p) if p.ends_with(['/', '\\']) => path.starts_with(&fold(p)),
+            Indicator::Path(p) => path == fold(p),
             _ => false,
         })
     }

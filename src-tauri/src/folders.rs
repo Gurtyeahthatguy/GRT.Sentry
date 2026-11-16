@@ -22,6 +22,9 @@ use crate::state::{Action, Finding, Issue, IssueKind, IssueTarget, Severity};
 
 const KIND: &str = "folder";
 
+/// What the baseline holds for a watched file whose removal was confirmed.
+const REMOVED: &str = "removed";
+
 /// Where every file should come from a package.
 const PROGRAM_DIRS: &[&str] = &["/usr/bin", "/usr/sbin", "/bin", "/sbin"];
 
@@ -224,6 +227,24 @@ pub fn judge_all(
         ));
     }
 
+    // Configuration that was there and is not any more.
+    if !first_run {
+        let present: HashSet<&str> = config.iter().map(|e| e.path()).collect();
+        for (path, value) in db::baseline_entries(conn, KIND) {
+            let watched = CONFIG_DIRS.iter().any(|d| path.starts_with(&format!("{d}/"))) || CONFIG_FILES.contains(&path.as_str());
+            if !watched || value == REMOVED || present.contains(path.as_str()) {
+                continue;
+            }
+            findings.push(finding(
+                Severity::Info,
+                format!("Removed: {path}"),
+                format!("{path} was there at the last scan and is gone now. Uninstalling something explains it; a removed file here can also undo a protection, such as a PAM rule or a sudo restriction."),
+                &path,
+                REMOVED.to_string(),
+            ));
+        }
+    }
+
     if first_run {
         let _ = db::mark_baseline_started(conn, KIND);
     }
@@ -279,6 +300,22 @@ mod tests {
         // Replaced again: new contents, reported again.
         let changed = hashes(&[("/usr/bin/ls", "aa"), ("/usr/bin/.sshd", "cc")]);
         assert_eq!(judge_all(&conn, &programs, &[], &[], Some(&owned), &HashMap::new(), &changed).len(), 1);
+    }
+
+    #[test]
+    fn a_removed_configuration_file_is_said_once_and_accepted_for_good() {
+        let conn = crate::db::open_memory();
+        let config = [file("/etc/sudoers.d/limits"), file("/etc/pam.d/common-auth")];
+        let digest = hashes(&[("/etc/sudoers.d/limits", "aa"), ("/etc/pam.d/common-auth", "bb")]);
+        judge_all(&conn, &[], &[], &config, None, &HashMap::new(), &digest);
+
+        let found = judge_all(&conn, &[], &[], &config[1..], None, &HashMap::new(), &digest);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].issue.title, "Removed: /etc/sudoers.d/limits");
+
+        let IssueTarget::Baseline { kind, key, value } = &found[0].target else { panic!() };
+        crate::resolve::accept_baseline(&conn, kind, key, value).unwrap();
+        assert!(judge_all(&conn, &[], &[], &config[1..], None, &HashMap::new(), &digest).is_empty());
     }
 
     #[test]

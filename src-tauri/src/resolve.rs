@@ -137,12 +137,20 @@ fn names_match(current: &str, expected: &str) -> bool {
     strip(current) == strip(expected)
 }
 
+/// Deletes a file only while it holds the contents a scan reported.
+pub fn delete_scanned(conn: &Connection, path: &str, sha256: &str, reason: &str) -> Result<(), String> {
+    crate::quarantine::still_as_scanned(path, sha256)?;
+    delete_file(conn, path, reason)
+}
+
 /// Deletes a file outright, with no undo.
 pub fn delete_file(conn: &Connection, path: &str, reason: &str) -> Result<(), String> {
-    let target = Path::new(path);
-    if !target.is_file() {
+    if !Path::new(path).is_file() {
         return Err(format!("{path} is not a file."));
     }
+    // Through a link the file itself goes, as with quarantine.
+    let real = crate::paths::real_path(path).map_err(|e| format!("Cannot follow {path}: {e}"))?;
+    let target = real.as_path();
 
     std::fs::remove_file(target).map_err(|e| format!("Cannot delete {path}: {e}"))?;
     let _ = db::forget_file(conn, path);

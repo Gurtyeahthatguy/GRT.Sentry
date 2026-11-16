@@ -27,10 +27,13 @@ fn ensure_dir() -> Result<PathBuf, String> {
 /// The hash is taken before the move, and is what proves later that the file
 /// coming out is the file that went in.
 pub fn quarantine_file(conn: &Connection, path: &str, reason: &str) -> Result<String, String> {
-    let source = Path::new(path);
-    if !source.is_file() {
+    if !Path::new(path).is_file() {
         return Err(format!("{path} is not a file"));
     }
+    // Through a link the file itself goes, not the link that points at it.
+    let real = paths::real_path(path).map_err(|e| format!("Cannot follow {path}: {e}"))?;
+    let real_text = real.to_string_lossy().into_owned();
+    let (source, path) = (real.as_path(), real_text.as_str());
 
     let metadata = fs::metadata(source).map_err(|e| format!("Cannot read {path}: {e}"))?;
     let original_mode = platform::permission_bits(&metadata);
@@ -61,6 +64,24 @@ pub fn quarantine_file(conn: &Connection, path: &str, reason: &str) -> Result<St
     actionlog::record(conn, actionlog::kind::QUARANTINE, path, Some(reason), true);
 
     Ok(id)
+}
+
+/// Quarantines a file only while it holds the contents a scan reported.
+///
+/// Between the scan and the button the file may have been swapped, or turned
+/// into a link to something else; acting then would move the wrong file.
+pub fn quarantine_scanned(conn: &Connection, path: &str, sha256: &str, reason: &str) -> Result<String, String> {
+    still_as_scanned(path, sha256)?;
+    quarantine_file(conn, path, reason)
+}
+
+/// Refuses when the file behind a path no longer hashes to what was reported.
+pub fn still_as_scanned(path: &str, sha256: &str) -> Result<(), String> {
+    let now = scanner::hash_file(Path::new(path)).map_err(|e| format!("Cannot read {path}: {e}"))?;
+    if !now.eq_ignore_ascii_case(sha256) {
+        return Err(format!("{path} has changed since the scan, so nothing was done. Scan again to see what it is now."));
+    }
+    Ok(())
 }
 
 /// `rename` when possible, copy-verify-remove when not.
@@ -329,6 +350,41 @@ mod tests {
             let mode = fs::metadata(&entry.quarantine_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0, "sealed again after reading");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn through_a_link_the_file_itself_goes_into_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = testenv::isolated_data_dir(&tmp.path().join("data"));
+        let real = tmp.path().join("payload.bin");
+        fs::write(&real, b"x").unwrap();
+        let link = tmp.path().join("innocent.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let conn = crate::db::open_memory();
+        quarantine_file(&conn, link.to_str().unwrap(), "test").unwrap();
+        assert!(!real.exists(), "the file the link pointed at is the one moved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_link_after_the_scan_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = testenv::isolated_data_dir(&tmp.path().join("data"));
+        let scanned = tmp.path().join("dropper.sh");
+        fs::write(&scanned, b"bad").unwrap();
+        let sha = scanner::hash_file(&scanned).unwrap();
+
+        let thesis = tmp.path().join("thesis.odt");
+        fs::write(&thesis, b"years of work").unwrap();
+        fs::remove_file(&scanned).unwrap();
+        std::os::unix::fs::symlink(&thesis, &scanned).unwrap();
+
+        let conn = crate::db::open_memory();
+        assert!(quarantine_scanned(&conn, scanned.to_str().unwrap(), &sha, "test").unwrap_err().contains("changed since the scan"));
+        assert!(crate::resolve::delete_scanned(&conn, scanned.to_str().unwrap(), &sha, "test").is_err());
+        assert_eq!(fs::read(&thesis).unwrap(), b"years of work");
     }
 
     #[test]

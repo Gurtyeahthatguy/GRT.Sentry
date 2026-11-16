@@ -9,7 +9,9 @@ and scans twice as the live user and twice as root on the untouched system:
 the second scans must raise no alarm. Then it plants one sample of each thing
 Sentry looks for, scans again both ways, and checks every sample was named.
 A last root scan, with the automatic response on, must call none of it new and
-must block the address that keeps failing to log in.
+must block the address that keeps failing to log in. Along the way the decoy
+port is knocked on under the profile, and the comparison after planting must
+name the new account and the new cron job.
 
 The samples are synthetic: EICAR built from its bytes, a few lines of shell,
 copies of system programs with bits set, a test library that hides one
@@ -115,9 +117,14 @@ logger -p authpriv.notice -t sudo "support : TTY=pts/0 ; PWD=/ ; USER=root ; COM
 cp /run/p/hider.so /usr/lib/x86_64-linux-gnu/libgrt-hider.so && echo /usr/lib/x86_64-linux-gnu/libgrt-hider.so > /etc/ld.so.preload
 cp /bin/sleep /tmp/grt-hidden && /tmp/grt-hidden 900 & sleep 1
 say "GRT-HIDER $(ls /proc | grep -c '^[0-9]') listed, ps sees $(ps -e | grep -c grt-hidden) grt-hidden"
+su grt -c 'cd; setsid grt-sentry --decoy >/tmp/decoy.log 2>&1 &'; sleep 3
+bash -c 'exec 3<>/dev/tcp/127.0.0.1/2222; exec 3>&-' 2>/dev/null; sleep 1
+say "GRT-DECOY $(head -c 300 /tmp/decoy.log | tr '\n' ' ')"
+pkill -f 'grt-sentry --decoy'
 
 scan grt USER-PLANTED
 scan root ROOT-PLANTED
+say "GRT-TIMELINE $(cd /root && HOME=/root grt-sentry --compare 2>&1 | grep -c -e 'added: toor' -e 'update-check')"
 
 # --- 0.4: the same things again are not news, and the automatic response ---
 bash /run/p/setup-nftables.sh >/dev/null 2>&1; say "GRT-NFT-SETUP $?"
@@ -162,6 +169,7 @@ EXPECTED = [
     ("new sudo user", "either", "support used sudo for the first time"),
     ("preload library", "either", "A library is being forced into every program that starts"),
     ("hidden process", "either", "A process is hiding: grt-hidden"),
+    ("knock on the decoy port", "user", "127.0.0.1 knocked on the decoy port"),
 ]
 
 
@@ -293,6 +301,12 @@ def main():
     for why in re.findall(r"GRT-WHY (.*)", text):
         print(f"   {why.strip()}")
     ok &= auto_ok
+
+    timeline = re.search(r"GRT-TIMELINE (\d+)", text)
+    print(f"changes on the machine after planting: {timeline.group(1) if timeline else 'none'} of 2 named")
+    ok &= bool(timeline and int(timeline.group(1)) >= 2)
+    decoy = re.search(r"GRT-DECOY (.*)", text)
+    print(f"decoy: {decoy.group(1).strip()[:200] if decoy else 'no output'}")
 
     compare = re.search(r"GRT-COMPARE (.*)", text)
     print(f"--compare: {compare.group(1).strip() if compare else 'nothing'}")

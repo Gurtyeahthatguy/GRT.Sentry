@@ -64,6 +64,8 @@ pub enum IssueKind {
     AccountActivity,
     /// A file in a watched system folder that no package explains.
     FolderChanged,
+    /// Someone connected to the decoy port.
+    DecoyTouched,
     /// A module could not run, for want of a key or a permission.
     ModuleUnavailable,
 }
@@ -203,6 +205,9 @@ pub struct SystemStatus {
     /// The row in the scan history, 0 before it is recorded.
     #[serde(default)]
     pub scan_id: i64,
+    /// How many things changed on the machine since the scan before.
+    #[serde(default)]
+    pub changes: u32,
 }
 
 impl Default for SystemStatus {
@@ -216,6 +221,7 @@ impl Default for SystemStatus {
             issues: vec![],
             new_issues: 0,
             scan_id: 0,
+            changes: 0,
         }
     }
 }
@@ -263,11 +269,15 @@ impl AppState {
     /// `bundled_geoip` is the packaged copy's path when the caller knows it.
     pub fn new(bundled_geoip: Option<std::path::PathBuf>) -> Result<Self, String> {
         let db = crate::db::open()?;
-        let config = Config::load();
+        let (config, writable) = Config::load_checked();
 
-        // Written back on every start, so a first run leaves a file to edit.
-        if let Err(e) = config.save() {
-            eprintln!("grt-sentry: could not write the configuration: {e}");
+        // Written back on every start, so a first run leaves a file to edit
+        // and a newer version's settings appear in it; a malformed file is
+        // left for its author to correct.
+        if writable {
+            if let Err(e) = config.save() {
+                eprintln!("grt-sentry: could not write the configuration: {e}");
+            }
         }
 
         Ok(Self {

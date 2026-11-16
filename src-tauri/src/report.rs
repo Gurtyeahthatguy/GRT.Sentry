@@ -118,6 +118,8 @@ pub struct Comparison {
     pub appeared: Vec<StoredIssue>,
     pub gone: Vec<StoredIssue>,
     pub unchanged: usize,
+    /// What changed on the machine in between, whether or not it was a problem.
+    pub changes: Vec<crate::timeline::Group>,
 }
 
 pub fn compare(older: ScanRecord, old: Vec<StoredIssue>, newer: ScanRecord, new: Vec<StoredIssue>) -> Comparison {
@@ -126,7 +128,7 @@ pub fn compare(older: ScanRecord, old: Vec<StoredIssue>, newer: ScanRecord, new:
     let unchanged = after.intersection(&before).count();
     let appeared = new.iter().filter(|i| !before.contains(i.fingerprint.as_str())).cloned().collect();
     let gone = old.iter().filter(|i| !after.contains(i.fingerprint.as_str())).cloned().collect();
-    Comparison { older, newer, appeared, gone, unchanged }
+    Comparison { older, newer, appeared, gone, unchanged, changes: Vec::new() }
 }
 
 pub fn render_comparison(comparison: &Comparison) -> String {
@@ -149,9 +151,26 @@ pub fn render_comparison(comparison: &Comparison) -> String {
     if partial {
         out.push_str(&format!("One of the two has counts only. {COUNTS_ONLY}\n"));
     } else if appeared.is_empty() && gone.is_empty() {
-        out.push_str("The two scans reported the same things.\n");
+        out.push_str("The two scans reported the same things.\n\n");
     }
+    render_changes(&mut out, &comparison.changes);
     out
+}
+
+fn render_changes(out: &mut String, groups: &[crate::timeline::Group]) {
+    let heading = "Changes on the machine";
+    out.push_str(&format!("{heading}\n{}\n\n", "-".repeat(heading.len())));
+    if groups.is_empty() {
+        out.push_str("Nothing that is recorded changed: startup entries, accounts, packages and the files in the scan folders are as they were.\n");
+        return;
+    }
+    for group in groups {
+        out.push_str(&format!("{}\n", group.heading));
+        for line in &group.lines {
+            out.push_str(&format!("  {line}\n"));
+        }
+        out.push('\n');
+    }
 }
 
 fn scan_or_latest(conn: &Connection, id: Option<i64>, skip: usize) -> Result<ScanRecord, String> {
@@ -176,7 +195,10 @@ pub fn comparison(conn: &Connection, older: Option<i64>, newer: Option<i64>) -> 
     let (older, newer) = if older.timestamp > newer.timestamp { (newer, older) } else { (older, newer) };
     let old = db::scan_issues(conn, older.id)?;
     let new = db::scan_issues(conn, newer.id)?;
-    Ok(compare(older, old, newer, new))
+    let changes = crate::timeline::collapse(db::machine_changes(conn, older.id, newer.id)?);
+    let mut comparison = compare(older, old, newer, new);
+    comparison.changes = crate::timeline::grouped(&changes);
+    Ok(comparison)
 }
 
 #[cfg(test)]
@@ -238,6 +260,21 @@ mod tests {
         assert!(text.contains("only its counts remain"), "{text}");
         let clean = ScanRecord { issues_found: 0, ..scan(2) };
         assert!(render(&clean, &[]).contains("Nothing needs attention"));
+    }
+
+    #[test]
+    fn a_comparison_lists_what_changed_on_the_machine() {
+        let conn = db::open_memory();
+        let one = db::record_scan(&conn, 0, 0).unwrap();
+        let mut accounts = std::collections::BTreeMap::new();
+        accounts.insert("me".to_string(), "uid 1000, /bin/bash".to_string());
+        crate::timeline::record(&conn, one, crate::timeline::ACCOUNTS, &accounts).unwrap();
+        let two = db::record_scan(&conn, 0, 0).unwrap();
+        accounts.insert("toor".to_string(), "uid 0, /bin/bash".to_string());
+        crate::timeline::record(&conn, two, crate::timeline::ACCOUNTS, &accounts).unwrap();
+
+        let text = render_comparison(&comparison(&conn, None, None).unwrap());
+        assert!(text.contains("Accounts\n  added: toor (uid 0, /bin/bash)"), "{text}");
     }
 
     #[test]

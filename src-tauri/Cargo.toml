@@ -1,6 +1,6 @@
 [package]
 name = "grt-sentry"
-version = "0.4.0"
+version = "0.5.0"
 description = "Local security scanner: checks files, connections and system state on demand"
 authors = ["GRT Project"]
 license = "MIT"
@@ -70,6 +70,8 @@ features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
   "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_Security_WinTrust",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Threading",
 ]

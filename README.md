@@ -142,6 +142,20 @@ takes hashes, file names, paths and IP addresses, one per line, with a note
 after the first space; a match on a file, a running program or a connection is
 critical. Both change only when you edit them.
 
+**What changed on the machine.** Every scan records what starts by itself,
+the accounts, the installed packages and the files in the scan folders, and
+keeps how each differs from the scan before. After a suspicion, "what is
+different since Tuesday" has an answer: in the History tab, in a saved
+comparison and from `--compare`. These are facts rather than problems, so they
+raise no alarm; something added and removed again in between is left out.
+
+**A decoy port.** Off until it is switched on. A port that offers no service
+and answers nothing, port 2222 unless another is chosen: nobody was told about
+it, so whoever connects is looking at what the machine answers. Each address is
+noted at most every ten seconds and reported at the next scan, with a button to
+block it. It listens only while the window is open, or while
+`grt-sentry --decoy` runs in a terminal, and never as a resident service.
+
 **A saved capture.** GRT Sentry never captures traffic, but it reads a `.pcap`
 or `.pcapng` that tcpdump or Wireshark recorded: who talked to whom, on which
 port, how much. Every address is compared with your indicators, and a match
@@ -156,8 +170,8 @@ are read again, so after the first scan the check costs a few milliseconds.
 
 ## Linux and Windows
 
-The two builds are the same program. What differs is who answers the questions,
-and in two places the answer is narrower on Windows.
+The two builds are the same program. What differs is who answers the questions.
+Where Windows cannot answer one, the table says so instead of pretending.
 
 | | Linux | Windows |
 |---|---|---|
@@ -167,12 +181,17 @@ and in two places the answer is narrower on Windows.
 | Block an address | an nftables set | a Defender Firewall rule |
 | Block for 24 hours | an nftables set whose elements time out | a firewall rule the first elevated scan after the day removes |
 | Stop a process | SIGTERM | `taskkill` |
-| Failed logins | `/var/log/auth.log` | Security event log, event 4625 |
+| Failed logins | `/var/log/auth.log` or the journal | Security event log, event 4625 |
+| New accounts, new administrators | `/etc/passwd`, sudo in the log | events 4720 and 4732, read by field name so a translated Windows reads the same |
+| Programs that run unsigned from the profile | **not checked**: Linux programs carry no signature | Authenticode, without the network |
+| The resident antivirus | none to ask | Defender: switched off, real-time protection off, signatures older than a week |
+| Confinement | the AppArmor profile in the `.deb` | libraries only from this machine, System32 first; nothing like AppArmor exists for a desktop program |
 | Startup entries | desktop files, user units, cron | Run keys, Startup folder, scheduled tasks |
 | Pending updates | `apt`, security pocket only | `winget`, every pending upgrade |
 | Forced libraries | `/etc/ld.so.preload` | `AppInit_DLLs` |
 | Packaged programs | dpkg or rpm records | **not checked**: Windows keeps no record to compare against |
-| Processes | `/proc` | the process list and each program's path |
+| Processes | `/proc` | the process list, each program's path and signature |
+| What changed between scans | files, startup entries, accounts, dpkg or rpm packages | files, startup entries, local accounts, installed programs |
 | Hidden processes, ports, modules | compared against `/proc` and `/sys` | **not checked**: no second listing to compare |
 | Privileged files, system folders, SSH, sudo, PATH | checked | **not checked** |
 | Browser extensions | Firefox, Chrome, Chromium, Brave, Edge, Vivaldi | the same |
@@ -222,6 +241,11 @@ buttons ask for confirmation.
 | Pending updates | Show the whole list, Set aside |
 | A new startup entry | Expected, Set aside |
 
+Quarantine, Delete, Send for analysis and Save as evidence act on a file only
+while it still holds the contents the scan reported. A file swapped since, or
+a link put in its place, is refused with a request to scan again, so nothing
+is moved, deleted or sent that nobody looked at.
+
 **Set aside** moves a card to a folded list at the bottom. It no longer counts
 towards the verdict, and later scans keep it there for as long as it stays the
 same: a file until its contents change, an address, a startup entry or a
@@ -262,8 +286,9 @@ the rules it matches. *Save as evidence* writes the same zip as on a card.
 anything until *Delete for good* is pressed.
 
 **The History tab** lists past scans. Each one opens as a report, plain text to
-read, print or send, and *What changed* compares it with the scan before:
-what appeared and what went. The latest hundred scans keep everything they
+read, print or send. *What changed* compares it with the scan before and
+*Since then* with the latest: which problems appeared and went, and what
+changed on the machine itself. The latest hundred scans keep everything they
 found.
 
 **The Settings tab** holds the API key, the folders to scan and to skip, the
@@ -285,6 +310,7 @@ grt-sentry --status        print the result of the last scan
 grt-sentry --report        print the last scan in full, to save or send
 grt-sentry --compare       print what changed between the last two scans
 grt-sentry --connections   list the active network connections
+grt-sentry --decoy         listen on the decoy port until stopped, and print who knocks
 grt-sentry --where         print where the data, configuration and quarantine live
 ```
 
@@ -331,7 +357,7 @@ during a scan and nothing else.
 cd src-tauri && cargo test
 ```
 
-253 tests. Among them: with no key and no network, EICAR is found on its own
+278 tests. Among them: with no key and no network, EICAR is found on its own
 and inside a zip; a zip, a gzip and a tar.gz bomb are each stopped and named,
 and an honest log file that compresses well is not; a replaced program in a fake
 dpkg tree is found and an untouched one is not; every rule has a sample it must
@@ -373,15 +399,16 @@ machine's real life, and the history already knows them. On a desktop Debian ins
 
 Boots a Debian live image in QEMU with no network, installs the package, and
 scans the untouched system as the live user and as root: neither may raise an
-alarm. Then it plants 25 samples, among them a replaced `whoami`, a
+alarm. Then it plants 26 samples, among them a replaced `whoami`, a
 set-user-ID shell in `/tmp`, a cron job and a systemd unit, a second root
 account, a sudo rule without a password, a process run from a deleted file,
 and a library in `/etc/ld.so.preload` that hides a process from every listing
-of `/proc`. All 25 must be named. A last root scan with the automatic response
+of `/proc`. All 26 must be named. A last root scan with the automatic response
 on must call none of them new, and must block for a day an address that keeps
-failing to log in. Last run: 25 of 25, no alarm on the clean image, none of the
-22 alarms called new the second time, the address blocked for a day, the
-profile in enforce and no AppArmor denial.
+failing to log in. Last run: 26 of 26 with the knock on the decoy port, no
+alarm on the clean image, none of the 22 alarms called new the second time,
+the address blocked for a day, the new account and cron job named among the
+changes, the profile in enforce and no AppArmor denial.
 
 ```bash
 ./scripts/check-weight.sh
@@ -430,8 +457,14 @@ To look at the interface without building anything:
   who knows it can open the files, and the archive's encryption is the old zip
   kind every tool can read.
 - On Windows the connections list is TCP only, and only IPv4 TCP connections
-  can be closed. Windows exposes no peer for a UDP association and no call that
-  ends an IPv6 connection.
+  can be closed. This stays so: the UDP table Windows exposes holds the local
+  end and the process but never the peer, and the only public call that ends
+  a connection, `SetTcpEntry`, takes an IPv4 row. Seeing UDP peers would take
+  a packet driver, which this program does not install. An unwanted IPv6
+  connection is answered by blocking the address or stopping the process.
+- A Windows program signed through a system catalog rather than in its own
+  file reads as unsigned, so only programs under the user's profile are
+  checked, where catalogs do not reach.
 
 ## Licence
 

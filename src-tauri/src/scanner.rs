@@ -32,7 +32,7 @@ use crate::db;
 use crate::state::{Action, Finding, Issue, IssueKind, IssueTarget, Severity};
 
 /// How long a stored VirusTotal answer stays good.
-const VERDICT_MAX_AGE: i64 = 7 * 24 * 60 * 60;
+pub const VERDICT_MAX_AGE: i64 = 7 * 24 * 60 * 60;
 
 /// Read size for hashing.
 const HASH_BUFFER: usize = 8192;
@@ -200,6 +200,21 @@ impl RateLimiter {
 
 // --- VirusTotal -----------------------------------------------------------
 
+/// A file's bytes, when they are still the ones a scan hashed and the path is
+/// not a link.
+pub fn read_as_scanned(path: &Path, expected_sha256: &str) -> Result<Vec<u8>, String> {
+    let link = std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(true);
+    if link {
+        return Err(format!("{} is no longer the file the scan saw. Scan again before sending it.", path.display()));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    if !hash.eq_ignore_ascii_case(expected_sha256) {
+        return Err(format!("{} has changed since the scan. Scan again before sending it.", path.display()));
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VtVerdict {
     /// Engines calling it malicious.
@@ -214,6 +229,20 @@ pub struct VtVerdict {
 impl VtVerdict {
     pub fn unknown() -> Self {
         Self { malicious: 0, suspicious: 0, total: 0, known: false }
+    }
+
+    /// What the cache keeps: the engine count, or -1 for a file VirusTotal has
+    /// never seen, which is not the same as one no engine flags.
+    pub fn stored(&self) -> i64 {
+        if self.known { self.malicious as i64 } else { -1 }
+    }
+
+    /// A cached answer, read back. The engine total is not kept.
+    pub fn from_stored(malicious: i64) -> Self {
+        if malicious < 0 {
+            return Self::unknown();
+        }
+        Self { malicious: malicious as u32, suspicious: 0, total: 0, known: true }
     }
 }
 
@@ -270,9 +299,11 @@ impl<'a> VtClient<'a> {
     /// Sends the file itself and waits for the report.
     ///
     /// VirusTotal keeps what it is given and shares it with the security
-    /// industry. Never called by a scan, only by the button that says so.
-    pub async fn upload_file(&self, path: &Path) -> Result<VtVerdict, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    /// industry. Never called by a scan, only by the button that says so, and
+    /// only with the very bytes the scan saw: a file swapped since, or a link
+    /// put in its place, is refused rather than sent.
+    pub async fn upload_file(&self, path: &Path, expected_sha256: &str) -> Result<VtVerdict, String> {
+        let bytes = read_as_scanned(path, expected_sha256)?;
 
         // The plain endpoint accepts up to 32 MB. Larger files need a
         // negotiated URL, which the free tier does not always grant.
@@ -510,6 +541,10 @@ pub struct ScanOutcome {
     pub queued: u32,
     /// Facts about the scan itself, such as a missing key.
     pub notes: Vec<String>,
+    /// Every file read, with its hash, for the record of the machine.
+    pub hashed: Vec<(String, String)>,
+    /// Set when the scan was stopped before the last file.
+    pub stopped: bool,
 }
 
 /// Hashes and checks the configured directories.
@@ -586,6 +621,7 @@ pub async fn run_scan(
     for (index, candidate) in candidates.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             outcome.notes.push("The scan was stopped before it finished.".to_string());
+            outcome.stopped = true;
             break;
         }
 
@@ -636,6 +672,7 @@ pub async fn run_scan(
         };
 
         outcome.files_checked += 1;
+        outcome.hashed.push((candidate.path.clone(), hash.clone()));
 
         // 2. A file the user has vouched for is not examined further.
         {
@@ -672,14 +709,8 @@ pub async fn run_scan(
 
         // 4. The verdict, reused or asked for or postponed.
         let verdict = match known_verdict.take() {
-            Some(malicious) => Some(VtVerdict {
-                malicious: malicious.max(0) as u32,
-                suspicious: 0,
-                // The engine count is not cached, so the message omits the
-                // total in this case.
-                total: 0,
-                known: true,
-            }),
+            // The engine total is not cached, so the message omits it.
+            Some(stored) => Some(VtVerdict::from_stored(stored)),
             None => match &client {
                 Some(client) if budget > 0 => {
                     budget -= 1;
@@ -693,7 +724,7 @@ pub async fn run_scan(
                     match client.lookup(&hash).await {
                         Ok(verdict) => {
                             let conn = db.lock().unwrap();
-                            let _ = db::put_verdict(&conn, &hash, verdict.malicious as i64);
+                            let _ = db::put_verdict(&conn, &hash, verdict.stored());
                             Some(verdict)
                         }
                         Err(e) => {
@@ -722,9 +753,10 @@ pub async fn run_scan(
         if let Some(verdict) = &verdict {
             if config.auto_quarantine && verdict.known && verdict.malicious >= config.auto_quarantine_threshold {
                 let conn = db.lock().unwrap();
-                match crate::quarantine::quarantine_file(
+                match crate::quarantine::quarantine_scanned(
                     &conn,
                     &candidate.path,
+                    &hash,
                     &format!("flagged by {} engines", verdict.malicious),
                 ) {
                     Ok(_) => quarantined = true,
@@ -779,6 +811,35 @@ fn short_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_virustotal_never_saw_stays_unknown_in_the_cache() {
+        let unknown = VtVerdict::unknown();
+        assert_eq!(VtVerdict::from_stored(unknown.stored()), unknown);
+        let clean = VtVerdict { malicious: 0, suspicious: 0, total: 70, known: true };
+        let back = VtVerdict::from_stored(clean.stored());
+        assert!(back.known && back.malicious == 0, "no engine flags it, which is a different answer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_bytes_the_scan_saw_are_ever_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("setup.run");
+        std::fs::write(&file, b"seen").unwrap();
+        let seen = hash_file(&file).unwrap();
+        assert_eq!(read_as_scanned(&file, &seen).unwrap(), b"seen");
+
+        std::fs::write(&file, b"swapped").unwrap();
+        assert!(read_as_scanned(&file, &seen).unwrap_err().contains("changed since the scan"));
+
+        // A link to something private, put where the file was.
+        let secret = dir.path().join("id_ed25519");
+        std::fs::write(&secret, b"seen").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&secret, &file).unwrap();
+        assert!(read_as_scanned(&file, &seen).unwrap_err().contains("no longer the file"));
+    }
     use std::io::Write;
 
     #[test]

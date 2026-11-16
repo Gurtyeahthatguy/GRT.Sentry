@@ -47,12 +47,20 @@ pub fn geoip_candidates(bundled: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 /// Expands a leading `~` in a configured path.
+/// The file a path leads to, through any link, written as people write it:
+/// Windows' `\\?\C:\` form loses its prefix.
+pub fn real_path(path: &str) -> std::io::Result<PathBuf> {
+    let real = std::fs::canonicalize(path)?;
+    let text = real.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => Ok(PathBuf::from(rest)),
+        _ => Ok(real),
+    }
+}
+
 pub fn expand_tilde(path: &str) -> PathBuf {
     let home = || {
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(platform::home_dir)
     };
 
     if path == "~" {

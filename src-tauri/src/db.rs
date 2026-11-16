@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::paths;
 
 /// Bumped when the schema changes in a way that needs migrating.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Seconds since the epoch.
 pub fn now() -> i64 {
@@ -190,7 +190,35 @@ fn apply_schema(conn: &Connection) -> Result<(), String> {
             expires_at INTEGER
         );
 
+        -- What the machine held at the last scan, by kind: files, startup
+        -- entries, accounts, packages.
+        CREATE TABLE IF NOT EXISTS machine_state (
+            kind  TEXT NOT NULL,
+            key   TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (kind, key)
+        );
+
+        -- How it differed from the scan before, kept for the same scans as
+        -- their issues.
+        CREATE TABLE IF NOT EXISTS machine_changes (
+            scan_id INTEGER NOT NULL,
+            kind    TEXT NOT NULL,
+            key     TEXT NOT NULL,
+            before  TEXT,
+            after   TEXT
+        );
+
+        -- Who connected to the decoy port, and when.
+        CREATE TABLE IF NOT EXISTS decoy_hits (
+            at   INTEGER NOT NULL,
+            ip   TEXT NOT NULL,
+            port INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS decoy_hits_time ON decoy_hits (at);
         CREATE INDEX IF NOT EXISTS scan_issues_scan ON scan_issues (scan_id);
+        CREATE INDEX IF NOT EXISTS machine_changes_scan ON machine_changes (scan_id);
         CREATE INDEX IF NOT EXISTS action_log_time ON action_log (timestamp DESC);
         CREATE INDEX IF NOT EXISTS scan_history_time ON scan_history (timestamp DESC);
         "#,
@@ -506,13 +534,93 @@ pub fn record_scan_issues(conn: &Connection, scan_id: i64, issues: &[StoredIssue
             .map_err(wrap)?;
         }
     }
+    for table in ["scan_issues", "machine_changes"] {
+        tx.execute(
+            &format!(
+                "DELETE FROM {table} WHERE scan_id NOT IN
+                 (SELECT id FROM scan_history ORDER BY timestamp DESC, id DESC LIMIT ?1)"
+            ),
+            params![SCANS_KEPT],
+        )
+        .map_err(wrap)?;
+    }
+    tx.commit().map_err(wrap)
+}
+
+// --- the machine between scans --------------------------------------------
+
+/// What the last scan recorded for a kind, or `None` before the first.
+pub fn machine_state(conn: &Connection, kind: &str) -> Result<Option<std::collections::BTreeMap<String, String>>, String> {
+    let started = conn
+        .query_row("SELECT 1 FROM meta WHERE key = ?1", params![format!("state:{kind}")], |_| Ok(()))
+        .optional()
+        .map_err(wrap)?
+        .is_some();
+    if !started {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT key, value FROM machine_state WHERE kind = ?1").map_err(wrap)?;
+    let rows = stmt.query_map(params![kind], |row| Ok((row.get(0)?, row.get(1)?))).map_err(wrap)?;
+    rows.collect::<Result<_, _>>().map(Some).map_err(wrap)
+}
+
+/// One key that appeared, went or changed.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MachineChange {
+    pub kind: String,
+    pub key: String,
+    /// `None` when it appeared.
+    pub before: Option<String>,
+    /// `None` when it went.
+    pub after: Option<String>,
+}
+
+/// Replaces what is recorded for a kind and keeps how it changed.
+pub fn put_machine_state(
+    conn: &Connection,
+    scan_id: i64,
+    kind: &str,
+    now: &std::collections::BTreeMap<String, String>,
+    changes: &[MachineChange],
+) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(wrap)?;
+    tx.execute("DELETE FROM machine_state WHERE kind = ?1", params![kind]).map_err(wrap)?;
+    {
+        let mut insert = tx
+            .prepare("INSERT INTO machine_state (kind, key, value) VALUES (?1, ?2, ?3)")
+            .map_err(wrap)?;
+        for (key, value) in now {
+            insert.execute(params![kind, key, value]).map_err(wrap)?;
+        }
+        let mut change = tx
+            .prepare("INSERT INTO machine_changes (scan_id, kind, key, before, after) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .map_err(wrap)?;
+        for c in changes {
+            change.execute(params![scan_id, c.kind, c.key, c.before, c.after]).map_err(wrap)?;
+        }
+    }
     tx.execute(
-        "DELETE FROM scan_issues WHERE scan_id NOT IN
-         (SELECT id FROM scan_history ORDER BY timestamp DESC, id DESC LIMIT ?1)",
-        params![SCANS_KEPT],
+        "INSERT INTO meta (key, value) VALUES (?1, '1') ON CONFLICT(key) DO NOTHING",
+        params![format!("state:{kind}")],
     )
     .map_err(wrap)?;
     tx.commit().map_err(wrap)
+}
+
+/// Every change recorded by the scans after `older` up to `newer`, oldest first.
+pub fn machine_changes(conn: &Connection, older: i64, newer: i64) -> Result<Vec<MachineChange>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, key, before, after FROM machine_changes
+             WHERE scan_id > ?1 AND scan_id <= ?2 ORDER BY scan_id, rowid",
+        )
+        .map_err(wrap)?;
+    let rows = stmt
+        .query_map(params![older, newer], |row| {
+            Ok(MachineChange { kind: row.get(0)?, key: row.get(1)?, before: row.get(2)?, after: row.get(3)? })
+        })
+        .map_err(wrap)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(wrap)
 }
 
 pub fn scan_issues(conn: &Connection, scan_id: i64) -> Result<Vec<StoredIssue>, String> {
@@ -590,6 +698,38 @@ pub fn set_issue_aside(conn: &Connection, fingerprint: &str, kind: &str, aside: 
     )
     .map_err(wrap)?;
     Ok(())
+}
+
+// --- the decoy port -------------------------------------------------------
+
+/// Hits kept; older ones go first.
+const DECOY_KEPT: i64 = 10_000;
+
+pub fn record_decoy_hit(conn: &Connection, ip: &str, port: u16) -> Result<(), String> {
+    conn.execute("INSERT INTO decoy_hits (at, ip, port) VALUES (?1, ?2, ?3)", params![now(), ip, port as i64])
+        .map_err(wrap)?;
+    conn.execute(
+        "DELETE FROM decoy_hits WHERE rowid <= (SELECT MAX(rowid) FROM decoy_hits) - ?1",
+        params![DECOY_KEPT],
+    )
+    .map_err(wrap)?;
+    Ok(())
+}
+
+/// Per address since a moment: how many times, the last time, the last port.
+pub fn decoy_hits_since(conn: &Connection, since: i64) -> Result<Vec<(String, u32, i64, u16)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ip, COUNT(*), MAX(at), (SELECT port FROM decoy_hits d WHERE d.ip = h.ip ORDER BY at DESC LIMIT 1)
+             FROM decoy_hits h WHERE at >= ?1 GROUP BY ip ORDER BY MAX(at) DESC",
+        )
+        .map_err(wrap)?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok((row.get(0)?, row.get::<_, i64>(1)? as u32, row.get(2)?, row.get::<_, i64>(3)? as u16))
+        })
+        .map_err(wrap)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(wrap)
 }
 
 // --- blocked addresses ----------------------------------------------------
@@ -760,6 +900,12 @@ pub fn baseline_hash(conn: &Connection, path: &str) -> Option<String> {
         .flatten()
 }
 
+/// Forgets a watched file, after the user confirmed it was removed on purpose.
+pub fn remove_baseline(conn: &Connection, path: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM integrity_baseline WHERE path = ?1", params![path]).map_err(wrap)?;
+    Ok(())
+}
+
 pub fn set_baseline(conn: &Connection, path: &str, sha256: &str) -> Result<(), String> {
     conn.execute(
         "INSERT INTO integrity_baseline (path, sha256, updated_at) VALUES (?1, ?2, ?3)
@@ -820,6 +966,16 @@ pub fn baseline_value(conn: &Connection, kind: &str, key: &str) -> Option<String
         .optional()
         .ok()
         .flatten()
+}
+
+/// Everything a check has recorded, key to value.
+pub fn baseline_entries(conn: &Connection, kind: &str) -> Vec<(String, String)> {
+    let Ok(mut stmt) = conn.prepare("SELECT key, value FROM baseline WHERE kind = ?1 AND key != ''") else {
+        return Vec::new();
+    };
+    stmt.query_map(params![kind], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
 }
 
 /// Whether a check has recorded anything yet, which tells a first run apart.
@@ -939,8 +1095,23 @@ pub fn list_actions(conn: &Connection, limit: u32) -> Result<Vec<ActionRecord>, 
 }
 
 pub fn get_action(conn: &Connection, id: i64) -> Result<Option<ActionRecord>, String> {
-    let actions = list_actions(conn, 100_000)?;
-    Ok(actions.into_iter().find(|a| a.id == id))
+    conn.query_row(
+        "SELECT id, timestamp, action, target, reason, reversible, reverted FROM action_log WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(ActionRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                action: row.get(2)?,
+                target: row.get(3)?,
+                reason: row.get(4)?,
+                reversible: row.get::<_, i64>(5)? != 0,
+                reverted: row.get::<_, i64>(6)? != 0,
+            })
+        },
+    )
+    .optional()
+    .map_err(wrap)
 }
 
 pub fn mark_action_reverted(conn: &Connection, id: i64) -> Result<(), String> {

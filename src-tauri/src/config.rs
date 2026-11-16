@@ -70,6 +70,11 @@ pub struct Config {
     pub auto_block: bool,
     pub auto_block_after: u32,
 
+    /// Listen on a port that offers nothing, while the window is open. Off by
+    /// default.
+    pub decoy: bool,
+    pub decoy_port: u16,
+
     /// Run a quick scan as soon as the window opens.
     pub scan_on_startup: bool,
 
@@ -98,6 +103,8 @@ impl Default for Config {
             failed_login_threshold: 5,
             auto_block: false,
             auto_block_after: 10,
+            decoy: false,
+            decoy_port: 2222,
             scan_on_startup: true,
             theme: "system".to_string(),
         }
@@ -116,15 +123,21 @@ impl Config {
     /// A malformed file is left alone rather than overwritten, so a hand edit
     /// can be corrected.
     pub fn load() -> Self {
+        Self::load_checked().0
+    }
+
+    /// The configuration, and whether writing it back is safe: false when the
+    /// file is there but malformed, so a typo never costs the settings.
+    pub fn load_checked() -> (Self, bool) {
         let path = paths::config_path();
         let Ok(text) = fs::read_to_string(&path) else {
-            return Config::default();
+            return (Config::default(), !path.exists());
         };
         match toml::from_str::<Config>(&text) {
-            Ok(config) => config,
+            Ok(config) => (config, true),
             Err(e) => {
-                eprintln!("grt-sentry: {} is not valid TOML ({e}); using defaults", path.display());
-                Config::default()
+                eprintln!("grt-sentry: {} is not valid TOML ({e}); using defaults and leaving it as it is", path.display());
+                (Config::default(), false)
             }
         }
     }
@@ -193,6 +206,8 @@ pub struct ConfigView {
     pub failed_login_threshold: u32,
     pub auto_block: bool,
     pub auto_block_after: u32,
+    pub decoy: bool,
+    pub decoy_port: u16,
     pub scan_on_startup: bool,
     pub theme: String,
 }
@@ -223,6 +238,8 @@ impl From<&Config> for ConfigView {
             failed_login_threshold: c.failed_login_threshold,
             auto_block: c.auto_block,
             auto_block_after: c.auto_block_after,
+            decoy: c.decoy,
+            decoy_port: c.decoy_port,
             scan_on_startup: c.scan_on_startup,
             theme: c.theme.clone(),
         }
@@ -254,6 +271,7 @@ pub struct ConfigUpdate {
     pub failed_login_threshold: Option<u32>,
     pub auto_block: Option<bool>,
     pub auto_block_after: Option<u32>,
+    pub decoy_port: Option<u16>,
     pub scan_on_startup: Option<bool>,
     pub theme: Option<String>,
 }
@@ -320,6 +338,9 @@ impl ConfigUpdate {
         }
         if let Some(v) = self.auto_block_after {
             config.auto_block_after = v.clamp(3, 1000);
+        }
+        if let Some(v) = self.decoy_port.filter(|v| *v > 0) {
+            config.decoy_port = v;
         }
         if let Some(v) = self.scan_on_startup {
             config.scan_on_startup = v;
@@ -396,6 +417,20 @@ mod tests {
         assert!(!config.auto_block);
         ConfigUpdate { auto_block_after: Some(1), ..Default::default() }.apply(&mut config);
         assert_eq!(config.auto_block_after, 3);
+    }
+
+    #[test]
+    fn a_malformed_file_is_never_written_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::testenv::isolated_config_dir(tmp.path());
+        let (_, writable) = Config::load_checked();
+        assert!(writable, "no file yet: the first run writes one");
+
+        std::fs::create_dir_all(paths::config_dir()).unwrap();
+        std::fs::write(paths::config_path(), "virustotal_api_key = \"abc\"\ndeep_scan = maybe\n").unwrap();
+        let (config, writable) = Config::load_checked();
+        assert!(!writable);
+        assert!(config.virustotal_api_key.is_none(), "defaults are used meanwhile");
     }
 
     #[test]

@@ -19,6 +19,8 @@ mod cli;
 mod config;
 mod content;
 mod dashboard;
+mod decoy;
+mod defender;
 mod extensions;
 mod folders;
 mod db;
@@ -44,10 +46,12 @@ mod rules;
 mod scanner;
 mod schedule;
 mod state;
+mod timeline;
 #[cfg(test)]
 mod testenv;
 mod updates;
 mod watcher;
+mod winevents;
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -62,6 +66,9 @@ use crate::state::{AppState, Issue, IssueTarget, SystemStatus};
 
 /// Holds the optional folder watcher, so switching it off drops it.
 struct WatcherState(Mutex<Option<watcher::FolderWatcher>>);
+
+/// Holds the decoy listener while the window is open and it is switched on.
+struct DecoyState(Mutex<Option<decoy::Decoy>>);
 
 // --- scanning -------------------------------------------------------------
 
@@ -139,31 +146,33 @@ async fn scan_file(state: State<'_, AppState>, path: String) -> Result<FileRepor
     let (trusted, cached) = {
         let conn = state.db.lock().unwrap();
         let _ = db::put_file(&conn, &path, &sha256, size, scanner::modified_at(&metadata));
-        (db::is_allowed(&conn, &sha256), db::verdict_for_hash(&conn, &sha256, 0))
+        (db::is_allowed(&conn, &sha256), db::verdict_for_hash(&conn, &sha256, scanner::VERDICT_MAX_AGE))
     };
 
-    let (api_key, interval, limits) = {
+    let (api_key, interval, mut limits) = {
         let config = state.config.lock().unwrap();
         (config.api_key(), config.vt_interval_seconds, content::Limits::for_config(&config))
     };
+    // The user's own rules and indicators count here as in a scan.
+    limits.own_rules = indicators::load_rules().rules;
+    let own_indicators = indicators::Indicators::load();
+    limits.indicators = std::sync::Arc::new(own_indicators.clone());
 
     let inspect_path = target.clone();
-    let report = tokio::task::spawn_blocking(move || content::inspect(&inspect_path, &limits))
+    let mut report = tokio::task::spawn_blocking(move || content::inspect(&inspect_path, &limits))
         .await
         .map_err(|e| format!("The file could not be inspected: {e}"))?;
+    if let Some(note) = own_indicators.match_file(&path, &sha256) {
+        report.hits.push(rules::indicator_hit(&note));
+    }
 
     let verdict = match (cached, api_key) {
-        (Some(malicious), _) => Some(scanner::VtVerdict {
-            malicious: malicious.max(0) as u32,
-            suspicious: 0,
-            total: 0,
-            known: true,
-        }),
+        (Some(stored), _) => Some(scanner::VtVerdict::from_stored(stored)),
         (None, Some(key)) => {
             let client = scanner::VtClient::new(key, &state.vt, Duration::from_secs(interval))?;
             let verdict = client.lookup(&sha256).await?;
             let conn = state.db.lock().unwrap();
-            let _ = db::put_verdict(&conn, &sha256, verdict.malicious as i64);
+            let _ = db::put_verdict(&conn, &sha256, verdict.stored());
             Some(verdict)
         }
         (None, None) => None,
@@ -245,10 +254,10 @@ async fn resolve_issue(
         };
         let key = api_key.ok_or_else(|| "No VirusTotal API key is set.".to_string())?;
         let client = scanner::VtClient::new(key, &state.vt, Duration::from_secs(interval))?;
-        let verdict = client.upload_file(std::path::Path::new(path)).await?;
+        let verdict = client.upload_file(std::path::Path::new(path), sha256).await?;
 
         let conn = state.db.lock().unwrap();
-        let _ = db::put_verdict(&conn, sha256, verdict.malicious as i64);
+        let _ = db::put_verdict(&conn, sha256, verdict.stored());
         actionlog::record(&conn, actionlog::kind::UPLOAD_VT, path, Some("sent by the user"), false);
         dashboard::dismiss(&state, &issue_id);
 
@@ -262,12 +271,12 @@ async fn resolve_issue(
     let conn = state.db.lock().unwrap();
 
     let message = match (&target, action.as_str()) {
-        (IssueTarget::File { path, .. }, "quarantine") => {
-            quarantine::quarantine_file(&conn, path, note.as_deref().unwrap_or("quarantined from the dashboard"))?;
+        (IssueTarget::File { path, sha256 }, "quarantine") => {
+            quarantine::quarantine_scanned(&conn, path, sha256, note.as_deref().unwrap_or("quarantined from the dashboard"))?;
             format!("{path} is in quarantine.")
         }
-        (IssueTarget::File { path, .. }, "delete") => {
-            resolve::delete_file(&conn, path, note.as_deref().unwrap_or("deleted from the dashboard"))?;
+        (IssueTarget::File { path, sha256 }, "delete") => {
+            resolve::delete_scanned(&conn, path, sha256, note.as_deref().unwrap_or("deleted from the dashboard"))?;
             format!("{path} is gone.")
         }
         (IssueTarget::File { sha256, path }, "trust") => {
@@ -308,8 +317,7 @@ async fn resolve_issue(
         }
 
         (IssueTarget::Integrity { path, current_hash }, "update_baseline") => {
-            integrity::accept_current(&conn, path, current_hash)?;
-            format!("The current contents of {path} are the new reference.")
+            integrity::accept_current(&conn, path, current_hash)?
         }
         (IssueTarget::Package { path, digest }, "update_baseline") => {
             packages::accept(&conn, path, digest)?;
@@ -364,6 +372,9 @@ async fn resolve_issue(
             let text = authlog::read_privileged(&path)?;
             let threshold = { state.config.lock().unwrap().failed_login_threshold };
             let mut found = authlog::findings_from_text(&text, threshold, db::now());
+            if winevents::is_event_xml(&text) {
+                found.extend(winevents::account_findings(&conn, &winevents::parse(&text, db::now()), db::now()));
+            }
             response::mark_blocked(&conn, &mut found, db::now());
             drop(conn);
 
@@ -634,13 +645,21 @@ struct SystemInfo {
     indicators_path: String,
     indicator_count: usize,
     quarantined_files: usize,
+    /// What confines this process, in a sentence.
+    confinement: String,
     recent_scans: Vec<ScanRecord>,
     schedule: schedule::ScheduleStatus,
     watched_folders: Vec<String>,
+    /// The port the decoy listens on, when it does.
+    decoy_listening: Option<u16>,
 }
 
 #[tauri::command]
-fn system_info(state: State<'_, AppState>, watcher_state: State<'_, WatcherState>) -> SystemInfo {
+fn system_info(
+    state: State<'_, AppState>,
+    watcher_state: State<'_, WatcherState>,
+    decoy_state: State<'_, DecoyState>,
+) -> SystemInfo {
     let conn = state.db.lock().unwrap();
     SystemInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -663,6 +682,7 @@ fn system_info(state: State<'_, AppState>, watcher_state: State<'_, WatcherState
         indicators_path: indicators::indicators_path().to_string_lossy().into_owned(),
         indicator_count: indicators::Indicators::load().len(),
         quarantined_files: db::list_quarantine(&conn).map(|q| q.len()).unwrap_or(0),
+        confinement: platform::confinement(),
         recent_scans: db::recent_scans(&conn, 10).unwrap_or_default(),
         schedule: schedule::status(),
         watched_folders: watcher_state
@@ -672,6 +692,7 @@ fn system_info(state: State<'_, AppState>, watcher_state: State<'_, WatcherState
             .as_ref()
             .map(|w| w.watching.clone())
             .unwrap_or_default(),
+        decoy_listening: decoy_state.0.lock().unwrap().as_ref().map(|d| d.port),
     }
 }
 
@@ -718,8 +739,40 @@ fn set_watcher(
     Ok(true)
 }
 
+/// Turns the decoy port on or off, and remembers the choice.
+#[tauri::command]
+fn set_decoy(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    decoy_state: State<'_, DecoyState>,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<Option<u16>, String> {
+    let port = {
+        let mut config = state.config.lock().unwrap();
+        if let Some(port) = port.filter(|p| *p > 0) {
+            config.decoy_port = port;
+        }
+        config.decoy_port
+    };
+    let mut slot = decoy_state.0.lock().unwrap();
+    // The old listener goes first, so the same port can be taken again.
+    *slot = None;
+    if enabled {
+        let emitter = app.clone();
+        *slot = Some(decoy::start(port, move |hit| {
+            let _ = emitter.emit("decoy-touched", hit);
+        })?);
+    }
+    let mut config = state.config.lock().unwrap();
+    config.decoy = enabled;
+    config.save()?;
+    Ok(slot.as_ref().map(|d| d.port))
+}
+
 /// Runs a command-line mode when asked for one, otherwise opens the window.
 pub fn run() {
+    platform::harden_process();
     if let Some(code) = cli::maybe_run() {
         std::process::exit(code);
     }
@@ -738,10 +791,19 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
 
             let watch_on_start = state.config.lock().unwrap().watch_folders;
+            let decoy_on_start = state.config.lock().unwrap().decoy;
             let scan_on_start = state.config.lock().unwrap().scan_on_startup;
 
             app.manage(state);
             app.manage(WatcherState(Mutex::new(None)));
+            app.manage(DecoyState(Mutex::new(None)));
+
+            if decoy_on_start {
+                let handle = app.handle().clone();
+                if let Err(e) = set_decoy(handle.clone(), handle.state(), handle.state(), true, None) {
+                    eprintln!("grt-sentry: the decoy port did not open: {e}");
+                }
+            }
 
             if watch_on_start {
                 let handle = app.handle().clone();
@@ -810,6 +872,7 @@ pub fn run() {
             system_info,
             set_schedule,
             set_watcher,
+            set_decoy,
         ])
         .run(tauri::generate_context!())
         .expect("GRT Sentry could not start");

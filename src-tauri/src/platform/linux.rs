@@ -19,13 +19,29 @@ pub const SYSTEM_NAME: &str = "Linux";
 
 // --- where things live ----------------------------------------------------
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+/// `HOME`, or the account's home from the user database when a service
+/// started this without one; never a path relative to wherever it runs.
+pub fn home_dir() -> PathBuf {
+    home()
 }
 
+fn home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return home;
+    }
+    // SAFETY: getpwuid returns a pointer into static storage or null, read at once.
+    let from_passwd = unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        (!entry.is_null() && !(*entry).pw_dir.is_null())
+            .then(|| std::ffi::CStr::from_ptr((*entry).pw_dir).to_string_lossy().into_owned())
+    };
+    from_passwd.map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// An XDG directory, ignored when it is not absolute, as the specification says.
 fn xdg(var: &str, fallback: &str) -> PathBuf {
-    match std::env::var_os(var) {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
+    match std::env::var_os(var).map(PathBuf::from) {
+        Some(value) if value.is_absolute() => value,
         _ => home().join(fallback),
     }
 }
@@ -937,6 +953,53 @@ pub fn accounts() -> Option<Vec<Account>> {
     )
 }
 
+/// Accounts for the record of the machine, name to user ID and shell.
+pub fn account_list() -> Option<std::collections::BTreeMap<String, String>> {
+    Some(accounts()?.into_iter().map(|a| (a.name, format!("uid {}, {}", a.uid, a.shell))).collect())
+}
+
+/// Installed packages, name to version, from dpkg or rpm.
+pub fn installed_packages() -> Option<std::collections::BTreeMap<String, String>> {
+    if let Ok(text) = fs::read_to_string("/var/lib/dpkg/status") {
+        return Some(crate::timeline::parse_dpkg_status(&text));
+    }
+    if which("rpm").is_some() {
+        let text = run_plain("rpm", &["-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"]).ok()?;
+        return Some(crate::timeline::parse_rpm_list(&text));
+    }
+    None
+}
+
+/// Linux programs carry no signature to check.
+pub fn signed(_path: &Path) -> Option<bool> {
+    None
+}
+
+pub fn in_user_profile(_path: &str) -> bool {
+    false
+}
+
+/// There is no Defender here.
+pub fn defender_status() -> Option<Result<String, String>> {
+    None
+}
+
+/// AppArmor does it from outside, when the profile is loaded.
+pub fn harden_process() {}
+
+/// What confines this process, in one line for the settings page.
+pub fn confinement() -> String {
+    let label = fs::read_to_string("/proc/self/attr/apparmor/current")
+        .or_else(|_| fs::read_to_string("/proc/self/attr/current"))
+        .unwrap_or_default();
+    let label = label.trim_end_matches(['\0', '\n']).trim();
+    if label.is_empty() || label == "unconfined" {
+        "not confined: the AppArmor profile is not loaded for this copy, which is the case for a build run from its folder".to_string()
+    } else {
+        format!("AppArmor, {label}")
+    }
+}
+
 /// The SSH server's configuration with its includes spliced in, when an SSH
 /// server is installed.
 pub fn sshd_config() -> Option<String> {
@@ -1432,6 +1495,12 @@ pub fn scheduling_supported() -> bool {
 
 /// `Persistent=true` matters on a laptop: a scan missed because the machine
 /// was off runs shortly after it comes back.
+/// A path as one word of an `ExecStart=` line, whatever spaces or signs it holds.
+fn unit_quoted(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%");
+    format!("\"{text}\"")
+}
+
 pub fn schedule_install(frequency: &str, executable: &Path) -> Result<(), String> {
     let dir = unit_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
@@ -1445,7 +1514,7 @@ pub fn schedule_install(frequency: &str, executable: &Path) -> Result<(), String
          ExecStart={} --scan\n\
          Nice=10\n\
          IOSchedulingClass=idle\n",
-        executable.display()
+        unit_quoted(executable)
     );
 
     let timer = format!(
@@ -1527,6 +1596,12 @@ mod tests {
             remote: remote.parse().unwrap(),
             remote_port,
         }
+    }
+
+    #[test]
+    fn a_path_with_spaces_stays_one_word_in_the_unit() {
+        let quoted = unit_quoted(Path::new("/home/me/GRT Sentry/50% \"done\"/grt-sentry"));
+        assert_eq!(quoted, "\"/home/me/GRT Sentry/50%% \\\"done\\\"/grt-sentry\"");
     }
 
     /// The filter is built here rather than by the caller, so this is where it

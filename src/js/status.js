@@ -50,6 +50,9 @@ export function initStatus() {
   listen("file-appeared", (event) => {
     toast(`Something new arrived: ${event.payload}`);
   });
+  listen("decoy-touched", (event) => {
+    toast(`${event.payload.ip} knocked on the decoy port ${event.payload.port}.`, true);
+  });
 
   api.currentStatus().then(render).catch(() => {});
 }
@@ -93,7 +96,7 @@ function describeFileReport(report) {
   clear(nodes.issues);
 
   const card = el("div", "issue is-info");
-  card.append(el("div", "issue-title", report.path.split("/").pop()));
+  card.append(el("div", "issue-title", report.path.split(/[\\/]/).pop()));
   card.append(el("div", "issue-location", report.path));
 
   const lines = [];
@@ -206,6 +209,7 @@ function render(status) {
   parts.push(`${formatCount(status.files_checked)} files checked`);
   parts.push(`${formatCount(status.active_connections)} connections`);
   if (status.queued_files > 0) parts.push(`${formatCount(status.queued_files)} waiting for a verdict`);
+  if (status.changes > 0) parts.push(`${formatCount(status.changes)} changes on the machine since the scan before, in History`);
   nodes.counters.textContent = parts.join(" · ");
 
   clear(nodes.issues);
@@ -280,7 +284,12 @@ async function saveEvidence(issue) {
 
 async function act(issue, action, card, result, actions) {
   if (action.destructive) {
-    const confirmed = await dialog.ask(`${action.label}: ${issue.location}\n\nThis cannot be undone.`, {
+    const consequence = {
+      block_ip: "It can be lifted from the action log in the Quarantine tab.",
+      upload_vt:
+        "The file's contents go to VirusTotal, which keeps them and shares them with security companies. That cannot be taken back.",
+    }[action.id] || "This cannot be undone.";
+    const confirmed = await dialog.ask(`${action.label}: ${issue.location}\n\n${consequence}`, {
       title: action.label,
       kind: "warning",
     });

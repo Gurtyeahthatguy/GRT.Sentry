@@ -33,6 +33,7 @@ export async function load() {
     actions.append(button("Save report…", () => saveReport(scan)));
     const previous = scans[index + 1];
     if (previous) actions.append(button("What changed", () => showComparison(previous, scan)));
+    if (index > 1) actions.append(button("Since then", () => showComparison(scan, scans[0])));
     card.append(actions);
     list.append(card);
   });
@@ -107,6 +108,17 @@ async function showComparison(older, newer) {
     )
   );
   node.append(changeList("Appeared", comparison.appeared), changeList("Gone", comparison.gone));
+
+  const machine = el("div", "change-list");
+  machine.append(el("h3", null, "Changes on the machine"));
+  if (comparison.changes.length === 0) {
+    machine.append(el("div", "empty", "Startup entries, accounts, packages and the files in the scan folders are as they were."));
+  }
+  for (const group of comparison.changes) {
+    machine.append(el("div", "issue-title", group.heading));
+    machine.append(el("pre", "report", group.lines.join("\n")));
+  }
+  node.append(machine);
   node.append(
     button("Save the comparison…", async () => {
       const path = await askWhereToSave(

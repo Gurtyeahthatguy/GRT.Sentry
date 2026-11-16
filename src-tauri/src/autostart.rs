@@ -27,6 +27,23 @@ pub fn collect() -> Vec<AutostartEntry> {
 
 const SOURCES: &str = "autostart-source";
 
+/// The values `reg query` prints for one key, name to data.
+///
+/// A line is `    Name    REG_SZ    Data`, and a name may hold spaces, so it
+/// is split at the type rather than at the first space.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_reg_values(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let at = line.find("    REG_")?;
+            let name = line[..at].trim();
+            let rest = line[at..].trim_start();
+            let data = rest.split_once(char::is_whitespace).map(|(_, d)| d.trim()).unwrap_or("");
+            (!name.is_empty()).then(|| (name.to_string(), data.to_string()))
+        })
+        .collect()
+}
+
 /// Whether this source has been looked at before, so its entries are news.
 ///
 /// Each source keeps its own first run: one added in a later version records
@@ -144,6 +161,21 @@ pub fn accept(conn: &Connection, key: &str, name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_value_with_spaces_in_its_name_is_still_one_entry() {
+        let text = "\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\n    \
+                    Adobe Acrobat Synchronizer    REG_SZ    \"C:\\Program Files\\Adobe\\AdobeCollabSync.exe\"\n    \
+                    evil    REG_EXPAND_SZ    %APPDATA%\\x.exe -q\n";
+        let values = parse_reg_values(text);
+        assert_eq!(
+            values,
+            vec![
+                ("Adobe Acrobat Synchronizer".to_string(), "\"C:\\Program Files\\Adobe\\AdobeCollabSync.exe\"".to_string()),
+                ("evil".to_string(), "%APPDATA%\\x.exe -q".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn the_first_run_records_everything_and_alarms_about_nothing() {

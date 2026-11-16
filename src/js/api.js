@@ -52,4 +52,5 @@ export const api = {
   systemInfo: () => invoke("system_info"),
   setSchedule: (enabled, frequency) => invoke("set_schedule", { enabled, frequency }),
   setWatcher: (enabled) => invoke("set_watcher", { enabled }),
+  setDecoy: (enabled, port) => invoke("set_decoy", { enabled, port }),
 };
