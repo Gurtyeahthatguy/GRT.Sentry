@@ -49,6 +49,9 @@ pub fn open_memory() -> Connection {
 }
 
 fn prepare(conn: &Connection) -> Result<(), String> {
+    // The window, a scheduled scan and the decoy may each hold the file for a
+    // moment; waiting beats failing.
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(wrap)?;
     // WAL keeps a reader from blocking a writer and survives a crash mid-scan.
     // NORMAL synchronous can lose the last transaction on a power cut, which
     // for a hash cache is not a loss.

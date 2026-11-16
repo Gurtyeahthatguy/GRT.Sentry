@@ -85,6 +85,9 @@ pub fn start(port: u16, on_hit: impl Fn(Hit) + Send + Sync + 'static) -> Result<
         listeners.push(v6);
     }
 
+    // Created here, once, so the listeners never race to set it up.
+    db::open()?;
+
     let stop = Arc::new(AtomicBool::new(false));
     let on_hit = Arc::new(on_hit);
     let threads = listeners
@@ -99,7 +102,7 @@ pub fn start(port: u16, on_hit: impl Fn(Hit) + Send + Sync + 'static) -> Result<
 }
 
 fn listen(listener: TcpListener, port: u16, stop: &AtomicBool, on_hit: &(dyn Fn(Hit) + Send + Sync)) {
-    let conn = db::open().ok();
+    let mut conn = db::open().ok();
     let mut last: HashMap<IpAddr, Instant> = HashMap::new();
     if listener.set_nonblocking(true).is_err() {
         return;
@@ -125,8 +128,16 @@ fn listen(listener: TcpListener, port: u16, stop: &AtomicBool, on_hit: &(dyn Fn(
         if last.len() > 10_000 {
             last.clear();
         }
-        if let Some(conn) = &conn {
-            let _ = db::record_decoy_hit(conn, &ip.to_string(), port);
+        if conn.is_none() {
+            conn = db::open().ok();
+        }
+        match &conn {
+            Some(conn) => {
+                if let Err(e) = db::record_decoy_hit(conn, &ip.to_string(), port) {
+                    eprintln!("grt-sentry: a knock on the decoy could not be recorded: {e}");
+                }
+            }
+            None => eprintln!("grt-sentry: a knock on the decoy could not be recorded: the database did not open"),
         }
         on_hit(Hit { ip: ip.to_string(), port });
     }

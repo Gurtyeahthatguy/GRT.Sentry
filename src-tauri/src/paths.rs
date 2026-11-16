@@ -58,6 +58,19 @@ pub fn real_path(path: &str) -> std::io::Result<PathBuf> {
     }
 }
 
+/// The path itself, or what it leads to when it is a link.
+///
+/// Only a link is resolved: resolving every path would turn a Windows short
+/// name such as RUNNER~1 into its long form, and the action log would then
+/// name a file the interface never showed.
+pub fn through_link(path: &str) -> std::io::Result<PathBuf> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        real_path(path)
+    } else {
+        Ok(PathBuf::from(path))
+    }
+}
+
 pub fn expand_tilde(path: &str) -> PathBuf {
     let home = || {
         std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(platform::home_dir)

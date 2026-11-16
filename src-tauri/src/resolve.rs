@@ -149,7 +149,7 @@ pub fn delete_file(conn: &Connection, path: &str, reason: &str) -> Result<(), St
         return Err(format!("{path} is not a file."));
     }
     // Through a link the file itself goes, as with quarantine.
-    let real = crate::paths::real_path(path).map_err(|e| format!("Cannot follow {path}: {e}"))?;
+    let real = crate::paths::through_link(path).map_err(|e| format!("Cannot follow {path}: {e}"))?;
     let target = real.as_path();
 
     std::fs::remove_file(target).map_err(|e| format!("Cannot delete {path}: {e}"))?;

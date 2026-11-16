@@ -31,7 +31,8 @@ pub fn quarantine_file(conn: &Connection, path: &str, reason: &str) -> Result<St
         return Err(format!("{path} is not a file"));
     }
     // Through a link the file itself goes, not the link that points at it.
-    let real = paths::real_path(path).map_err(|e| format!("Cannot follow {path}: {e}"))?;
+    // Any other path stays as written, so the log and the card agree.
+    let real = paths::through_link(path).map_err(|e| format!("Cannot follow {path}: {e}"))?;
     let real_text = real.to_string_lossy().into_owned();
     let (source, path) = (real.as_path(), real_text.as_str());
 
